@@ -11,12 +11,13 @@ func TestRegistryRegister(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	start := time.Unix(500, 0).UTC()
 
-	alpha, err := r.Register("alpha")
+	alpha, err := r.registerAt("alpha", start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	beta, err := r.Register("beta")
+	beta, err := r.registerAt("beta", start)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,20 +31,24 @@ func TestRegistryRegister(t *testing.T) {
 		t.Fatal("expected registration to initialize LastSeen")
 	}
 
-	again, err := r.Register("alpha")
+	againAt := start.Add(10 * time.Second)
+	again, err := r.registerAt("alpha", againAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again != alpha {
-		t.Fatalf("registration is not idempotent: %#v != %#v", again, alpha)
+	if again.NodeID != alpha.NodeID || again.VirtualIP != alpha.VirtualIP || again.SessionToken != alpha.SessionToken {
+		t.Fatalf("idempotent registration changed lease: %#v != %#v", again, alpha)
+	}
+	if !again.LastSeen.Equal(againAt) {
+		t.Fatalf("last_seen=%s want=%s", again.LastSeen, againAt)
 	}
 
 	byIP, ok := r.GetByVirtualIP(alpha.VirtualIP)
-	if !ok || byIP != alpha {
+	if !ok || byIP.NodeID != alpha.NodeID || byIP.SessionToken != alpha.SessionToken || !byIP.LastSeen.Equal(againAt) {
 		t.Fatalf("virtual IP lookup failed: %#v %v", byIP, ok)
 	}
 	byToken, ok := r.GetByToken(alpha.SessionToken)
-	if !ok || byToken != alpha {
+	if !ok || byToken.NodeID != alpha.NodeID || byToken.VirtualIP != alpha.VirtualIP || !byToken.LastSeen.Equal(againAt) {
 		t.Fatalf("token lookup failed: %#v %v", byToken, ok)
 	}
 }
