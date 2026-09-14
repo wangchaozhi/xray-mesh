@@ -23,9 +23,7 @@ func TestProcessValidateAndLifecycle(t *testing.T) {
 if [ "$2" = "-test" ]; then
   exit 0
 fi
-while true; do
-  sleep 1
-done
+exec sleep 60
 `
 	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
