@@ -41,7 +41,7 @@ func run() error {
 	enableTUN := flag.Bool("tun", false, "enable the Linux TUN peer data plane")
 	tunName := flag.String("tun-name", "xrmesh0", "mesh TUN interface name")
 	discoveryOverlay := flag.Bool("discovery-overlay", false, "route mDNS and SSDP multicast over the mesh TUN")
-	p2pProbe := flag.Bool("p2p-probe", false, "enable experimental authenticated direct UDP reachability probes")
+	p2pProbe := flag.Bool("p2p-probe", false, "enable experimental authenticated direct UDP reachability probes and direct peer payloads")
 	xrayBinary := flag.String("xray-bin", "xray", "path to the Xray Core binary")
 	xrayConfig := flag.String("xray-config", "", "path to an existing Xray JSON config; empty disables Xray supervision")
 	fullTunnel := flag.Bool("full-tunnel", false, "generate a temporary IPv4 Xray TUN profile and route Internet traffic through Xray")
@@ -382,17 +382,17 @@ func runTUN(ctx context.Context, serverURL string, registration mesh.Registratio
 	if enableP2PProbe {
 		runtime = newP2PRuntime(serverURL, registration, conn, remote)
 		runtime.Start(ctx)
-		log.Printf("experimental P2P reachability probes enabled")
+		log.Printf("experimental P2P reachability probes and direct peer payloads enabled")
 	}
 
 	if onReady != nil {
 		onReady()
 	}
 	log.Printf("mesh TUN=%s addr=%s relay=%s local_udp=%s", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote, conn.LocalAddr())
-	return pump(ctx, dev, conn, remote, registration.SessionToken, networkPrefix, runtime)
+	return pump(ctx, dev, conn, remote, registration.SessionToken, networkPrefix, virtualIP, runtime)
 }
 
-func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDPAddr, token string, prefix netip.Prefix, runtime *p2pRuntime) error {
+func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDPAddr, token string, prefix netip.Prefix, localVirtualIP netip.Addr, runtime *p2pRuntime) error {
 	errCh := make(chan error, 2)
 	classifier := router.PrefixClassifier{MeshPrefix: prefix}
 
@@ -411,6 +411,15 @@ func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDP
 			class := classifier.Classify(router.Packet{Source: src, Destination: dst, Payload: buf[:n]})
 			if class != router.ClassPeer && class != router.ClassDiscovery {
 				continue
+			}
+			if class == router.ClassPeer && runtime != nil {
+				sent, directErr := runtime.SendDirectPayload(dst, buf[:n])
+				if directErr != nil {
+					log.Printf("P2P direct send fallback dst=%s: %v", dst, directErr)
+				}
+				if sent {
+					continue
+				}
 			}
 			frame, err := transport.MarshalPacket(token, buf[:n])
 			if err != nil {
@@ -435,6 +444,18 @@ func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDP
 			if !sameUDPAddr(source, relay) {
 				if runtime != nil {
 					packetCopy := append([]byte(nil), buf[:n]...)
+					directPayload, handled, directErr := runtime.HandleDirectPayload(packetCopy, source, localVirtualIP)
+					if directErr != nil {
+						log.Printf("P2P direct payload drop from %s: %v", source, directErr)
+						continue
+					}
+					if handled {
+						if _, err := dev.WritePacket(ctx, directPayload); err != nil {
+							errCh <- err
+							return
+						}
+						continue
+					}
 					if err := runtime.HandleDatagram(packetCopy, source); err != nil {
 						log.Printf("P2P datagram drop from %s: %v", source, err)
 					}
