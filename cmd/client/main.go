@@ -360,9 +360,9 @@ func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, 
 	if err != nil {
 		return fmt.Errorf("resolve relay: %w", err)
 	}
-	conn, err := net.DialUDP("udp", nil, remote)
+	conn, err := openRelayUDPSocket(remote)
 	if err != nil {
-		return fmt.Errorf("dial relay: %w", err)
+		return fmt.Errorf("open relay UDP socket: %w", err)
 	}
 	defer conn.Close()
 
@@ -370,18 +370,18 @@ func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, 
 	if err != nil {
 		return err
 	}
-	if _, err := conn.Write(hello); err != nil {
+	if _, err := conn.WriteToUDP(hello, remote); err != nil {
 		return fmt.Errorf("relay hello: %w", err)
 	}
 
 	if onReady != nil {
 		onReady()
 	}
-	log.Printf("mesh TUN=%s addr=%s relay=%s", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote)
-	return pump(ctx, dev, conn, registration.SessionToken, networkPrefix)
+	log.Printf("mesh TUN=%s addr=%s relay=%s local_udp=%s", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote, conn.LocalAddr())
+	return pump(ctx, dev, conn, remote, registration.SessionToken, networkPrefix)
 }
 
-func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, token string, prefix netip.Prefix) error {
+func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDPAddr, token string, prefix netip.Prefix) error {
 	errCh := make(chan error, 2)
 	classifier := router.PrefixClassifier{MeshPrefix: prefix}
 
@@ -406,7 +406,7 @@ func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, token string, 
 				errCh <- err
 				return
 			}
-			if _, err := conn.Write(frame); err != nil {
+			if _, err := conn.WriteToUDP(frame, relay); err != nil {
 				errCh <- err
 				return
 			}
@@ -416,10 +416,16 @@ func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, token string, 
 	go func() {
 		buf := make([]byte, 64*1024)
 		for {
-			n, err := conn.Read(buf)
+			n, source, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				errCh <- err
 				return
+			}
+			if !sameUDPAddr(source, relay) {
+				// This socket intentionally remains available for future authenticated
+				// peer probe datagrams. Until the probe handler is wired into the
+				// client lifecycle, non-relay datagrams are ignored.
+				continue
 			}
 			frame, err := transport.ParseFrame(buf[:n])
 			if err != nil || frame.Type != transport.FrameDeliver {
