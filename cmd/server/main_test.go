@@ -20,6 +20,7 @@ func TestRegisterPeerReturnsLeasePolicy(t *testing.T) {
 	a := &api{registry: registry, heartbeatInterval: 15 * time.Second, leaseTTL: 60 * time.Second}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/peers", bytes.NewBufferString(`{"node_id":"alpha"}`))
+	req.Body = io.NopCloser(bytes.NewBufferString(`{"node_id":"alpha"}`))
 	rec := httptest.NewRecorder()
 	a.registerPeer(rec, req)
 	if rec.Code != http.StatusCreated {
