@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 var ErrInvalidNodeID = errors.New("node ID must not be empty")
@@ -38,6 +39,10 @@ func NewRegistry(prefix netip.Prefix) (*Registry, error) {
 func (r *Registry) Prefix() netip.Prefix { return r.prefix }
 
 func (r *Registry) Register(nodeID string) (Peer, error) {
+	return r.registerAt(nodeID, time.Now().UTC())
+}
+
+func (r *Registry) registerAt(nodeID string, seenAt time.Time) (Peer, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
 		return Peer{}, ErrInvalidNodeID
@@ -54,9 +59,10 @@ func (r *Registry) Register(nodeID string) (Peer, error) {
 	}
 	token, err := newSessionToken()
 	if err != nil {
+		_, _ = r.allocator.Release(nodeID)
 		return Peer{}, err
 	}
-	peer := Peer{NodeID: nodeID, VirtualIP: ip, SessionToken: token}
+	peer := Peer{NodeID: nodeID, VirtualIP: ip, SessionToken: token, LastSeen: seenAt.UTC()}
 	r.peers[nodeID] = peer
 	r.byIP[ip] = nodeID
 	r.byToken[token] = nodeID
@@ -98,6 +104,47 @@ func (r *Registry) GetByToken(token string) (Peer, bool) {
 	}
 	p, ok := r.peers[nodeID]
 	return p, ok
+}
+
+// TouchByToken records a successful heartbeat for the peer identified by the
+// current session token. Expired tokens are removed from byToken and therefore
+// cannot resurrect a removed lease.
+func (r *Registry) TouchByToken(token string, seenAt time.Time) (Peer, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nodeID, ok := r.byToken[token]
+	if !ok {
+		return Peer{}, false
+	}
+	peer, ok := r.peers[nodeID]
+	if !ok {
+		return Peer{}, false
+	}
+	peer.LastSeen = seenAt.UTC()
+	r.peers[nodeID] = peer
+	return peer, true
+}
+
+// ExpireBefore removes peers whose last successful registration/heartbeat is
+// at or before cutoff. It also invalidates their token/IP lookups and releases
+// the virtual address back to the allocator.
+func (r *Registry) ExpireBefore(cutoff time.Time) []Peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	expired := make([]Peer, 0)
+	for nodeID, peer := range r.peers {
+		if peer.LastSeen.After(cutoff) {
+			continue
+		}
+		expired = append(expired, peer)
+		delete(r.peers, nodeID)
+		delete(r.byIP, peer.VirtualIP)
+		delete(r.byToken, peer.SessionToken)
+		_, _ = r.allocator.Release(nodeID)
+	}
+	sort.Slice(expired, func(i, j int) bool { return expired[i].NodeID < expired[j].NodeID })
+	return expired
 }
 
 func (r *Registry) List() []Peer {
