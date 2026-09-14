@@ -41,6 +41,7 @@ func run() error {
 	enableTUN := flag.Bool("tun", false, "enable the Linux TUN peer data plane")
 	tunName := flag.String("tun-name", "xrmesh0", "mesh TUN interface name")
 	discoveryOverlay := flag.Bool("discovery-overlay", false, "route mDNS and SSDP multicast over the mesh TUN")
+	p2pProbe := flag.Bool("p2p-probe", false, "enable experimental authenticated direct UDP reachability probes")
 	xrayBinary := flag.String("xray-bin", "xray", "path to the Xray Core binary")
 	xrayConfig := flag.String("xray-config", "", "path to an existing Xray JSON config; empty disables Xray supervision")
 	fullTunnel := flag.Bool("full-tunnel", false, "generate a temporary IPv4 Xray TUN profile and route Internet traffic through Xray")
@@ -58,6 +59,9 @@ func run() error {
 	}
 	if *discoveryOverlay && !*enableTUN {
 		return errors.New("-discovery-overlay requires -tun")
+	}
+	if *p2pProbe && !*enableTUN {
+		return errors.New("-p2p-probe requires -tun")
 	}
 	if *xrayTUNMTU <= 0 {
 		return errors.New("-xray-tun-mtu must be greater than zero")
@@ -156,7 +160,7 @@ func run() error {
 		waitCh := make(chan error, 1)
 		tunWait = waitCh
 		go func() {
-			waitCh <- runTUN(ctx, registration, *relayAddr, *tunName, *discoveryOverlay, func() {
+			waitCh <- runTUN(ctx, *server, registration, *relayAddr, *tunName, *discoveryOverlay, *p2pProbe, func() {
 				tracker.SetMesh(health.StateRunning, nil)
 			})
 			close(waitCh)
@@ -327,7 +331,7 @@ func resolveHostIPv4(ctx context.Context, host string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, tunName string, discoveryOverlay bool, onReady func()) error {
+func runTUN(ctx context.Context, serverURL string, registration mesh.RegistrationView, relayAddr, tunName string, discoveryOverlay, enableP2PProbe bool, onReady func()) error {
 	virtualIP, err := netip.ParseAddr(registration.VirtualIP)
 	if err != nil {
 		return fmt.Errorf("invalid virtual IP from coordinator: %w", err)
@@ -374,14 +378,21 @@ func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, 
 		return fmt.Errorf("relay hello: %w", err)
 	}
 
+	var runtime *p2pRuntime
+	if enableP2PProbe {
+		runtime = newP2PRuntime(serverURL, registration, conn, remote)
+		runtime.Start(ctx)
+		log.Printf("experimental P2P reachability probes enabled")
+	}
+
 	if onReady != nil {
 		onReady()
 	}
 	log.Printf("mesh TUN=%s addr=%s relay=%s local_udp=%s", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote, conn.LocalAddr())
-	return pump(ctx, dev, conn, remote, registration.SessionToken, networkPrefix)
+	return pump(ctx, dev, conn, remote, registration.SessionToken, networkPrefix, runtime)
 }
 
-func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDPAddr, token string, prefix netip.Prefix) error {
+func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDPAddr, token string, prefix netip.Prefix, runtime *p2pRuntime) error {
 	errCh := make(chan error, 2)
 	classifier := router.PrefixClassifier{MeshPrefix: prefix}
 
@@ -422,9 +433,12 @@ func pump(ctx context.Context, dev tun.Device, conn *net.UDPConn, relay *net.UDP
 				return
 			}
 			if !sameUDPAddr(source, relay) {
-				// This socket intentionally remains available for future authenticated
-				// peer probe datagrams. Until the probe handler is wired into the
-				// client lifecycle, non-relay datagrams are ignored.
+				if runtime != nil {
+					packetCopy := append([]byte(nil), buf[:n]...)
+					if err := runtime.HandleDatagram(packetCopy, source); err != nil {
+						log.Printf("P2P datagram drop from %s: %v", source, err)
+					}
+				}
 				continue
 			}
 			frame, err := transport.ParseFrame(buf[:n])
