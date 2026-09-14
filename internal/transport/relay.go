@@ -33,15 +33,8 @@ const (
 var defaultDiscoveryDedupWindow = 750 * time.Millisecond
 
 type RelayOptions struct {
-	// DiscoveryRate is the sustained number of mDNS/SSDP packets per second
-	// accepted from each peer. Values <= 0 use the default.
-	DiscoveryRate float64
-	// DiscoveryBurst is the maximum token-bucket burst per peer. Values <= 0
-	// use the default.
-	DiscoveryBurst int
-	// DiscoveryDedupWindow suppresses identical discovery packets from the same
-	// peer during this window. A negative value uses the default; zero disables
-	// duplicate suppression.
+	DiscoveryRate        float64
+	DiscoveryBurst       int
 	DiscoveryDedupWindow time.Duration
 }
 
@@ -57,9 +50,6 @@ type discoveryPeerState struct {
 	seen       map[[32]byte]time.Time
 }
 
-// Relay forwards raw IPv4 packets between registered peers. It is a
-// development relay, not an encrypted tunnel. Deploy it only on a trusted path
-// or behind an existing secure transport.
 type Relay struct {
 	registry peerRegistry
 	conn     *net.UDPConn
@@ -88,12 +78,12 @@ func ListenRelayWithOptions(addr string, registry peerRegistry, options RelayOpt
 	}
 	options = normalizeRelayOptions(options)
 	return &Relay{
-		registry:   registry,
-		conn:       conn,
-		endpoints:  make(map[string]*net.UDPAddr),
-		discovery:  make(map[string]*discoveryPeerState),
-		options:    options,
-		now:        time.Now,
+		registry:  registry,
+		conn:      conn,
+		endpoints: make(map[string]*net.UDPAddr),
+		discovery: make(map[string]*discoveryPeerState),
+		options:   options,
+		now:       time.Now,
 	}, nil
 }
 
@@ -111,8 +101,18 @@ func normalizeRelayOptions(options RelayOptions) RelayOptions {
 }
 
 func (r *Relay) Addr() net.Addr { return r.conn.LocalAddr() }
+func (r *Relay) Close() error   { return r.conn.Close() }
 
-func (r *Relay) Close() error { return r.conn.Close() }
+// ForgetPeer removes transport state that must not survive a lease expiry.
+func (r *Relay) ForgetPeer(nodeID string) {
+	r.mu.Lock()
+	delete(r.endpoints, nodeID)
+	r.mu.Unlock()
+
+	r.discoveryMu.Lock()
+	delete(r.discovery, nodeID)
+	r.discoveryMu.Unlock()
+}
 
 func (r *Relay) Serve(ctx context.Context) error {
 	go func() {

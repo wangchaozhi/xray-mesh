@@ -56,7 +56,31 @@ func (a *Allocator) Allocate(nodeID string) (netip.Addr, error) {
 		a.next = offset + 1
 		return candidate, nil
 	}
+
+	// A released address may be below the monotonic cursor. Scan the reusable
+	// range once before reporting exhaustion.
+	for offset := uint32(2); offset < a.next && offset < capacity-1; offset++ {
+		candidate := addIPv4(base, offset)
+		if _, exists := a.used[candidate]; exists {
+			continue
+		}
+		a.byNode[nodeID] = candidate
+		a.used[candidate] = nodeID
+		return candidate, nil
+	}
 	return netip.Addr{}, ErrPoolExhausted
+}
+
+func (a *Allocator) Release(nodeID string) (netip.Addr, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ip, ok := a.byNode[nodeID]
+	if !ok {
+		return netip.Addr{}, false
+	}
+	delete(a.byNode, nodeID)
+	delete(a.used, ip)
+	return ip, true
 }
 
 func addIPv4(base [4]byte, offset uint32) netip.Addr {

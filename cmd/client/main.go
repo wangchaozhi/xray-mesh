@@ -71,6 +71,10 @@ func run() error {
 		return err
 	}
 	fmt.Printf("registered node=%s virtual_ip=%s prefix=%s\n", registration.NodeID, registration.VirtualIP, registration.NetworkPrefix)
+	heartbeatWait := startHeartbeat(ctx, *server, registration)
+	if registration.HeartbeatIntervalSeconds > 0 {
+		log.Printf("peer lease heartbeat=%ds ttl=%ds", registration.HeartbeatIntervalSeconds, registration.LeaseTTLSeconds)
+	}
 
 	xrayEnabled := strings.TrimSpace(*xrayConfig) != ""
 	tracker := health.New(registration.NodeID, registration.VirtualIP, registration.NetworkPrefix, *enableTUN, xrayEnabled)
@@ -173,6 +177,14 @@ func run() error {
 				tracker.SetXray(health.StateStopped, nil)
 			}
 			return nil
+		case err := <-heartbeatWait:
+			if err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return errors.New("peer heartbeat loop exited unexpectedly")
 		case err := <-tunWait:
 			if err != nil {
 				tracker.SetMesh(health.StateFailed, err)
