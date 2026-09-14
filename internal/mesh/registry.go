@@ -47,10 +47,13 @@ func (r *Registry) registerAt(nodeID string, seenAt time.Time) (Peer, error) {
 	if nodeID == "" {
 		return Peer{}, ErrInvalidNodeID
 	}
+	seenAt = seenAt.UTC()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, ok := r.peers[nodeID]; ok {
+		existing.LastSeen = seenAt
+		r.peers[nodeID] = existing
 		return existing, nil
 	}
 	ip, err := r.allocator.Allocate(nodeID)
@@ -62,7 +65,7 @@ func (r *Registry) registerAt(nodeID string, seenAt time.Time) (Peer, error) {
 		_, _ = r.allocator.Release(nodeID)
 		return Peer{}, err
 	}
-	peer := Peer{NodeID: nodeID, VirtualIP: ip, SessionToken: token, LastSeen: seenAt.UTC()}
+	peer := Peer{NodeID: nodeID, VirtualIP: ip, SessionToken: token, LastSeen: seenAt}
 	r.peers[nodeID] = peer
 	r.byIP[ip] = nodeID
 	r.byToken[token] = nodeID
@@ -106,9 +109,6 @@ func (r *Registry) GetByToken(token string) (Peer, bool) {
 	return p, ok
 }
 
-// TouchByToken records a successful heartbeat for the peer identified by the
-// current session token. Expired tokens are removed from byToken and therefore
-// cannot resurrect a removed lease.
 func (r *Registry) TouchByToken(token string, seenAt time.Time) (Peer, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -125,9 +125,6 @@ func (r *Registry) TouchByToken(token string, seenAt time.Time) (Peer, bool) {
 	return peer, true
 }
 
-// ExpireBefore removes peers whose last successful registration/heartbeat is
-// at or before cutoff. It also invalidates their token/IP lookups and releases
-// the virtual address back to the allocator.
 func (r *Registry) ExpireBefore(cutoff time.Time) []Peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
