@@ -1,14 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"net/netip"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/wangchaozhi/xray-mesh/internal/mesh"
+	"github.com/wangchaozhi/xray-mesh/internal/transport"
 )
 
 type registerRequest struct {
@@ -21,6 +27,7 @@ type api struct {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8666", "HTTP listen address")
+	relayListen := flag.String("relay-listen", "127.0.0.1:8667", "UDP relay listen address")
 	prefixText := flag.String("prefix", "10.66.0.0/24", "virtual IPv4 prefix")
 	flag.Parse()
 
@@ -33,6 +40,21 @@ func main() {
 		log.Fatalf("registry: %v", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	relay, err := transport.ListenRelay(*relayListen, registry)
+	if err != nil {
+		log.Fatalf("UDP relay: %v", err)
+	}
+	defer relay.Close()
+	go func() {
+		if err := relay.Serve(ctx); err != nil {
+			log.Printf("UDP relay stopped: %v", err)
+			stop()
+		}
+	}()
+
 	a := &api{registry: registry}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -42,8 +64,18 @@ func main() {
 	mux.HandleFunc("POST /v1/peers", a.registerPeer)
 	mux.HandleFunc("GET /v1/peers", a.listPeers)
 
-	log.Printf("xray-mesh coordinator listening on %s, prefix=%s", *listen, prefix)
-	log.Fatal(http.ListenAndServe(*listen, mux))
+	httpServer := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+
+	log.Printf("xray-mesh coordinator HTTP=%s UDP=%s prefix=%s", *listen, relay.Addr(), prefix)
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
 
 func (a *api) registerPeer(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +90,7 @@ func (a *api) registerPeer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusCreated, peer.View())
+	writeJSON(w, http.StatusCreated, peer.Registration(a.registry.Prefix()))
 }
 
 func (a *api) listPeers(w http.ResponseWriter, _ *http.Request) {

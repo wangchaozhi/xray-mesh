@@ -1,6 +1,8 @@
 package mesh
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/netip"
 	"sort"
@@ -13,7 +15,10 @@ var ErrInvalidNodeID = errors.New("node ID must not be empty")
 type Registry struct {
 	mu        sync.RWMutex
 	allocator *Allocator
+	prefix    netip.Prefix
 	peers     map[string]Peer
+	byIP      map[netip.Addr]string
+	byToken   map[string]string
 }
 
 func NewRegistry(prefix netip.Prefix) (*Registry, error) {
@@ -21,8 +26,16 @@ func NewRegistry(prefix netip.Prefix) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Registry{allocator: allocator, peers: make(map[string]Peer)}, nil
+	return &Registry{
+		allocator: allocator,
+		prefix:    prefix.Masked(),
+		peers:     make(map[string]Peer),
+		byIP:      make(map[netip.Addr]string),
+		byToken:   make(map[string]string),
+	}, nil
 }
+
+func (r *Registry) Prefix() netip.Prefix { return r.prefix }
 
 func (r *Registry) Register(nodeID string) (Peer, error) {
 	nodeID = strings.TrimSpace(nodeID)
@@ -39,14 +52,50 @@ func (r *Registry) Register(nodeID string) (Peer, error) {
 	if err != nil {
 		return Peer{}, err
 	}
-	peer := Peer{NodeID: nodeID, VirtualIP: ip}
+	token, err := newSessionToken()
+	if err != nil {
+		return Peer{}, err
+	}
+	peer := Peer{NodeID: nodeID, VirtualIP: ip, SessionToken: token}
 	r.peers[nodeID] = peer
+	r.byIP[ip] = nodeID
+	r.byToken[token] = nodeID
 	return peer, nil
+}
+
+func newSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (r *Registry) Get(nodeID string) (Peer, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	p, ok := r.peers[nodeID]
+	return p, ok
+}
+
+func (r *Registry) GetByVirtualIP(ip netip.Addr) (Peer, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	nodeID, ok := r.byIP[ip]
+	if !ok {
+		return Peer{}, false
+	}
+	p, ok := r.peers[nodeID]
+	return p, ok
+}
+
+func (r *Registry) GetByToken(token string) (Peer, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	nodeID, ok := r.byToken[token]
+	if !ok {
+		return Peer{}, false
+	}
 	p, ok := r.peers[nodeID]
 	return p, ok
 }
