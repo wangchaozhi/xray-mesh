@@ -16,6 +16,11 @@ import (
 
 var ErrUnauthorized = errors.New("unauthorized relay frame")
 
+var (
+	mdnsMulticast = netip.MustParseAddr("224.0.0.251")
+	ssdpMulticast = netip.MustParseAddr("239.255.255.250")
+)
+
 type peerRegistry interface {
 	GetByToken(string) (mesh.Peer, bool)
 	GetByVirtualIP(netip.Addr) (mesh.Peer, bool)
@@ -98,7 +103,7 @@ func (r *Relay) handleDatagram(b []byte, src *net.UDPAddr) error {
 		return fmt.Errorf("source IP %s does not match peer lease %s", sourceIP, peer.VirtualIP)
 	}
 
-	if isDiscovery(destinationIP) {
+	if isDiscoveryPacket(frame.Payload, destinationIP) {
 		return r.broadcast(peer.NodeID, frame.Payload)
 	}
 	destinationPeer, ok := r.registry.GetByVirtualIP(destinationIP)
@@ -108,8 +113,19 @@ func (r *Relay) handleDatagram(b []byte, src *net.UDPAddr) error {
 	return r.deliver(destinationPeer.NodeID, frame.Payload)
 }
 
-func isDiscovery(ip netip.Addr) bool {
-	return ip == netip.MustParseAddr("224.0.0.251") || ip == netip.MustParseAddr("239.255.255.250")
+func isDiscoveryPacket(payload []byte, destinationIP netip.Addr) bool {
+	_, destinationPort, err := packet.IPv4UDPPorts(payload)
+	if err != nil {
+		return false
+	}
+	switch destinationIP {
+	case mdnsMulticast:
+		return destinationPort == 5353
+	case ssdpMulticast:
+		return destinationPort == 1900
+	default:
+		return false
+	}
 }
 
 func (r *Relay) bind(nodeID string, addr *net.UDPAddr) {

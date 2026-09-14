@@ -40,6 +40,7 @@ func run() error {
 	nodeID := flag.String("node", "", "unique node ID")
 	enableTUN := flag.Bool("tun", false, "enable the Linux TUN peer data plane")
 	tunName := flag.String("tun-name", "xrmesh0", "mesh TUN interface name")
+	discoveryOverlay := flag.Bool("discovery-overlay", false, "route mDNS and SSDP multicast over the mesh TUN")
 	xrayBinary := flag.String("xray-bin", "xray", "path to the Xray Core binary")
 	xrayConfig := flag.String("xray-config", "", "path to an existing Xray JSON config; empty disables Xray supervision")
 	fullTunnel := flag.Bool("full-tunnel", false, "generate a temporary IPv4 Xray TUN profile and route Internet traffic through Xray")
@@ -54,6 +55,9 @@ func run() error {
 	}
 	if *fullTunnel && strings.TrimSpace(*xrayConfig) == "" {
 		return errors.New("-full-tunnel requires -xray-config")
+	}
+	if *discoveryOverlay && !*enableTUN {
+		return errors.New("-discovery-overlay requires -tun")
 	}
 	if *xrayTUNMTU <= 0 {
 		return errors.New("-xray-tun-mtu must be greater than zero")
@@ -148,7 +152,7 @@ func run() error {
 		waitCh := make(chan error, 1)
 		tunWait = waitCh
 		go func() {
-			waitCh <- runTUN(ctx, registration, *relayAddr, *tunName, func() {
+			waitCh <- runTUN(ctx, registration, *relayAddr, *tunName, *discoveryOverlay, func() {
 				tracker.SetMesh(health.StateRunning, nil)
 			})
 			close(waitCh)
@@ -311,7 +315,7 @@ func resolveHostIPv4(ctx context.Context, host string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, tunName string, onReady func()) error {
+func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, tunName string, discoveryOverlay bool, onReady func()) error {
 	virtualIP, err := netip.ParseAddr(registration.VirtualIP)
 	if err != nil {
 		return fmt.Errorf("invalid virtual IP from coordinator: %w", err)
@@ -332,6 +336,12 @@ func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, 
 
 	if err := dev.Configure(ctx, netip.PrefixFrom(virtualIP, networkPrefix.Bits())); err != nil {
 		return err
+	}
+	if discoveryOverlay {
+		if err := tun.ConfigureDiscovery(ctx, dev); err != nil {
+			return fmt.Errorf("configure discovery overlay: %w", err)
+		}
+		log.Printf("mesh discovery overlay enabled for mDNS and SSDP")
 	}
 
 	remote, err := net.ResolveUDPAddr("udp", relayAddr)

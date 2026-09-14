@@ -61,6 +61,20 @@ func (d *linuxDevice) Configure(ctx context.Context, addr netip.Prefix) error {
 		{"link", "set", "dev", d.name, "mtu", "1280", "up"},
 		{"addr", "replace", addr.String(), "dev", d.name},
 	}
+	return runIPCommands(ctx, commands)
+}
+
+// ConfigureDiscovery routes mDNS and SSDP multicast destinations into the
+// mesh TUN. It is opt-in because these host routes can change how local
+// multicast discovery behaves on the machine.
+func ConfigureDiscovery(ctx context.Context, device Device) error {
+	if device == nil {
+		return fmt.Errorf("TUN device is required")
+	}
+	return runIPCommands(ctx, discoveryCommands(device.Name()))
+}
+
+func runIPCommands(ctx context.Context, commands [][]string) error {
 	for _, args := range commands {
 		cmd := exec.CommandContext(ctx, "ip", args...)
 		out, err := cmd.CombinedOutput()
