@@ -5,62 +5,49 @@
 The project is intentionally split into two responsibilities:
 
 - **Mesh / east-west traffic:** assign stable virtual IPs, register peers, route peer-to-peer packets, and later support local-network discovery forwarding.
-- **Xray / north-south traffic:** hand Internet-bound traffic to an existing Xray/VLESS deployment instead of inventing a new obfuscation or censorship-evasion protocol.
+- **Xray / north-south traffic:** supervise an existing Xray Core deployment instead of reimplementing VLESS, REALITY, or other transport protocols.
 
 ## Status
 
-Early prototype. The current tree now provides a compilable control plane plus a Linux-only peer data-plane MVP:
+Early prototype. The current tree provides a control plane, a Linux-only peer data-plane MVP, and an Xray process supervisor:
 
 - client and server commands;
 - peer registration over HTTP;
 - deterministic virtual IPv4 allocation from `10.66.0.0/24`;
 - concurrency-safe peer registry;
-- packet/router interfaces;
-- a Linux TUN implementation for overlay peer traffic;
-- a development UDP relay with per-registration session tokens and source-IP anti-spoofing;
+- Linux TUN implementation for overlay peer traffic;
+- development UDP relay with per-registration session tokens and source-IP anti-spoofing;
 - packet classification for mesh, mDNS/SSDP discovery, and future Internet egress;
-- discovery and Xray adapter interfaces/stubs;
+- Xray config validation plus child-process lifecycle supervision;
 - unit tests and GitHub Actions CI.
 
-The peer data plane is intentionally an MVP: the UDP relay is **not encrypted**, Internet egress is not wired to Xray yet, and the control plane is not production-authenticated.
+The peer data plane is intentionally an MVP: the UDP relay is **not encrypted**, general Internet traffic is not routed into the mesh TUN, and the control plane is not production-authenticated.
 
 ## Architecture
 
 ```text
-+---------------- client ----------------+
-|                                        |
-|  Apps                                  |
-|    |                                   |
-|   TUN  <-- Linux MVP device            |
-|    |                                   |
-|  Mesh Router                           |
-|    |\                                  |
-|    | +--> Peer traffic --> Mesh tunnel |
-|    |                                   |
-|    +----> Internet --> Xray/VLESS      |
-+-------------------|--------------------+
-                    |
-               coordinator
-                    |
-        peer registry / virtual IPs
++-------------------- client ---------------------+
+|                                                 |
+| Apps                                            |
+|  |                                              |
+| mesh TUN ----> peer/discovery traffic ----------+--> mesh relay
+|                                                 |
+| Xray supervisor --> existing Xray Core ---------+--> Internet
++-------------------------------------------------+
+                         |
+                    coordinator
+                         |
+             peer registry / virtual IPs
 ```
 
-### Planned data plane
-
-```text
-peer A (10.66.0.2) <---- coordinator UDP relay ----> peer B (10.66.0.3)
-          \
-           +---- Internet-bound packets ----> Xray/VLESS adapter ----> Internet
-```
-
-Discovery protocols such as mDNS and SSDP will be handled as explicit, bounded relays rather than blindly flooding every packet.
+The current design deliberately keeps the mesh TUN scoped to the overlay prefix. That avoids routing Xray's own server connection back into the mesh TUN and creating a recursive routing loop. Full/selected Internet routing will be added later with explicit policy routing.
 
 ## Goals
 
 1. One client process can participate in a private overlay network.
 2. Each peer receives a virtual IP.
-3. Overlay peer traffic is routed directly through the mesh data plane.
-4. Internet-bound traffic can be handed to an existing Xray/VLESS stack.
+3. Overlay peer traffic is routed through the mesh data plane.
+4. The same client can supervise an existing Xray Core instance for Internet egress.
 5. Selected discovery traffic can later be relayed across the overlay.
 6. Keep the mesh layer transport-agnostic so the underlying tunnel can evolve independently.
 
@@ -87,7 +74,7 @@ A registration-only client still works without elevated privileges:
 go run ./cmd/client -server http://127.0.0.1:8666 -node laptop
 ```
 
-On Linux, enable the peer data plane with a TUN device (normally requires root or `CAP_NET_ADMIN`):
+On Linux, enable the peer mesh TUN (normally requires root or `CAP_NET_ADMIN`):
 
 ```bash
 sudo go run ./cmd/client \
@@ -97,7 +84,21 @@ sudo go run ./cmd/client \
   -tun
 ```
 
-A second peer will receive another address in `10.66.0.0/24`; after both peers have started with `-tun`, traffic to their virtual IPs is relayed through the coordinator. The MVP does **not** route general Internet traffic into the TUN yet.
+To let the same client validate, start, monitor, and stop an existing Xray Core process, provide the Xray binary and a normal Xray JSON config:
+
+```bash
+sudo go run ./cmd/client \
+  -server http://SERVER_IP:8666 \
+  -relay SERVER_IP:8667 \
+  -node laptop \
+  -tun \
+  -xray-bin /usr/local/bin/xray \
+  -xray-config /etc/xray/config.json
+```
+
+Before starting Xray, `xray-mesh` runs Xray's config test command. If the child process exits unexpectedly, the client reports the failure instead of silently continuing. `SIGINT`/`SIGTERM` is shared across the mesh and Xray lifecycle.
+
+At this stage Xray and the mesh are managed by one client process, but Internet packets are **not yet injected into Xray by the mesh TUN**. Existing Xray system proxy/TUN configuration can continue to provide Internet egress independently while `xrmesh0` carries only overlay traffic.
 
 Run tests:
 
@@ -128,10 +129,12 @@ go test ./...
 
 ### Phase 3 — Xray integration
 
-- [ ] Xray process adapter
+- [x] Xray process supervisor
+- [x] config validation and lifecycle monitoring
+- [ ] generated Xray configuration/profile model
 - [ ] SOCKS/transparent egress adapter
 - [ ] policy routing for selected destinations
-- [ ] lifecycle and health reporting
+- [ ] loop-safe full-tunnel mode
 
 ### Phase 4 — discovery
 
@@ -142,7 +145,7 @@ go test ./...
 
 ## Security model
 
-The current HTTP registration endpoint is development-only and unauthenticated, and the UDP relay is not encrypted. Do not expose this prototype directly to untrusted networks. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, encrypted transport, token rotation, and stronger endpoint binding. The Xray integration point is intentionally separate so an existing secure transport can later carry the data plane without inventing a new obfuscation protocol.
+The current HTTP registration endpoint is development-only and unauthenticated, and the UDP relay is not encrypted. Do not expose this prototype directly to untrusted networks. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, encrypted transport, token rotation, and stronger endpoint binding. The Xray integration intentionally uses an existing Xray binary/config instead of inventing a new transport or obfuscation protocol.
 
 ## License
 

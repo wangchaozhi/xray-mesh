@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -22,31 +23,106 @@ import (
 	"github.com/wangchaozhi/xray-mesh/internal/router"
 	"github.com/wangchaozhi/xray-mesh/internal/transport"
 	"github.com/wangchaozhi/xray-mesh/internal/tun"
+	xraycore "github.com/wangchaozhi/xray-mesh/internal/xray"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	server := flag.String("server", "http://127.0.0.1:8666", "coordinator base URL")
 	relayAddr := flag.String("relay", "127.0.0.1:8667", "UDP relay address")
 	nodeID := flag.String("node", "", "unique node ID")
 	enableTUN := flag.Bool("tun", false, "enable the Linux TUN peer data plane")
 	tunName := flag.String("tun-name", "xrmesh0", "TUN interface name")
+	xrayBinary := flag.String("xray-bin", "xray", "path to the Xray Core binary")
+	xrayConfig := flag.String("xray-config", "", "path to an existing Xray JSON config; empty disables Xray supervision")
 	flag.Parse()
 
 	if strings.TrimSpace(*nodeID) == "" {
-		log.Fatal("-node is required")
+		return errors.New("-node is required")
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	registration, err := register(*server, *nodeID)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fmt.Printf("registered node=%s virtual_ip=%s prefix=%s\n", registration.NodeID, registration.VirtualIP, registration.NetworkPrefix)
-	if !*enableTUN {
-		return
+
+	var xrayWait <-chan error
+	var xrayProcess *xraycore.Process
+	if strings.TrimSpace(*xrayConfig) != "" {
+		xrayProcess = xraycore.NewProcess(*xrayBinary, *xrayConfig)
+		xrayProcess.Stdout = os.Stdout
+		xrayProcess.Stderr = os.Stderr
+		if err := xrayProcess.Validate(ctx); err != nil {
+			return err
+		}
+		if err := xrayProcess.Start(ctx); err != nil {
+			return err
+		}
+		defer xrayProcess.Close()
+
+		waitCh := make(chan error, 1)
+		xrayWait = waitCh
+		go func() {
+			waitCh <- xrayProcess.Wait()
+			close(waitCh)
+		}()
+		log.Printf("Xray supervisor started binary=%s config=%s", *xrayBinary, *xrayConfig)
 	}
 
-	if err := runTUN(registration, *relayAddr, *tunName); err != nil {
-		log.Fatal(err)
+	if !*enableTUN {
+		if xrayProcess == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-xrayWait:
+			if err != nil {
+				return fmt.Errorf("xray exited: %w", err)
+			}
+			return errors.New("xray exited unexpectedly")
+		}
+	}
+
+	tunWait := make(chan error, 1)
+	go func() {
+		tunWait <- runTUN(ctx, registration, *relayAddr, *tunName)
+		close(tunWait)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-tunWait:
+			if err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return errors.New("mesh TUN exited unexpectedly")
+		case err := <-xrayWait:
+			if xrayWait == nil {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("xray exited: %w", err)
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return errors.New("xray exited unexpectedly")
+		}
 	}
 }
 
@@ -74,7 +150,7 @@ func register(server, nodeID string) (mesh.RegistrationView, error) {
 	return registration, nil
 }
 
-func runTUN(registration mesh.RegistrationView, relayAddr, tunName string) error {
+func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, tunName string) error {
 	virtualIP, err := netip.ParseAddr(registration.VirtualIP)
 	if err != nil {
 		return fmt.Errorf("invalid virtual IP from coordinator: %w", err)
@@ -93,8 +169,6 @@ func runTUN(registration mesh.RegistrationView, relayAddr, tunName string) error
 	}
 	defer dev.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	if err := dev.Configure(ctx, netip.PrefixFrom(virtualIP, networkPrefix.Bits())); err != nil {
 		return err
 	}
@@ -117,7 +191,7 @@ func runTUN(registration mesh.RegistrationView, relayAddr, tunName string) error
 		return fmt.Errorf("relay hello: %w", err)
 	}
 
-	log.Printf("mesh TUN=%s addr=%s relay=%s; Internet egress is not enabled yet", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote)
+	log.Printf("mesh TUN=%s addr=%s relay=%s; Internet traffic remains outside the mesh TUN", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote)
 	return pump(ctx, dev, conn, registration.SessionToken, networkPrefix)
 }
 
