@@ -25,10 +25,11 @@ type Process struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	done   chan error
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	done    chan struct{}
+	waitErr error
 }
 
 func NewProcess(binary, config string) *Process {
@@ -82,23 +83,27 @@ func (p *Process) Start(ctx context.Context) error {
 		return fmt.Errorf("start xray: %w", err)
 	}
 
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	p.cmd = cmd
 	p.cancel = cancel
 	p.done = done
+	p.waitErr = nil
 
 	go func() {
 		err := cmd.Wait()
 		if childCtx.Err() != nil {
 			err = nil
 		}
-		done <- err
+		p.mu.Lock()
+		p.waitErr = err
+		p.mu.Unlock()
 		close(done)
 	}()
 	return nil
 }
 
-// Wait blocks until the supervised Xray process exits.
+// Wait blocks until the supervised Xray process exits. Multiple callers can
+// safely wait for the same process and receive the same result.
 func (p *Process) Wait() error {
 	p.mu.Lock()
 	done := p.done
@@ -106,17 +111,31 @@ func (p *Process) Wait() error {
 	if done == nil {
 		return ErrNotStarted
 	}
-	return <-done
+	<-done
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waitErr
 }
 
 func (p *Process) Running() bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.cmd != nil && p.cmd.Process != nil && p.cmd.ProcessState == nil
+	done := p.done
+	cmd := p.cmd
+	p.mu.Unlock()
+	if cmd == nil || done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // Close is idempotent. It cancels the command context; os/exec then terminates
-// the child process and Wait observes a clean supervisor-driven shutdown.
+// the child process. The closed done channel broadcasts completion to all
+// concurrent Wait callers instead of making them compete for one result.
 func (p *Process) Close() error {
 	p.mu.Lock()
 	cancel := p.cancel
