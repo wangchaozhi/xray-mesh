@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/wangchaozhi/xray-mesh/internal/mesh"
+	"github.com/wangchaozhi/xray-mesh/internal/p2p"
 	"github.com/wangchaozhi/xray-mesh/internal/transport"
 )
 
@@ -24,6 +25,7 @@ type registerRequest struct {
 
 type api struct {
 	registry          *mesh.Registry
+	relay             *transport.Relay
 	heartbeatInterval time.Duration
 	leaseTTL          time.Duration
 }
@@ -88,7 +90,7 @@ func main() {
 
 	go runLeaseSweeper(ctx, registry, relay, *peerLease, *heartbeatInterval)
 
-	a := &api{registry: registry, heartbeatInterval: *heartbeatInterval, leaseTTL: *peerLease}
+	a := &api{registry: registry, relay: relay, heartbeatInterval: *heartbeatInterval, leaseTTL: *peerLease}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "text/plain; charset=utf-8")
@@ -97,6 +99,7 @@ func main() {
 	mux.HandleFunc("POST /v1/peers", a.registerPeer)
 	mux.HandleFunc("GET /v1/peers", a.listPeers)
 	mux.HandleFunc("POST /v1/heartbeat", a.heartbeat)
+	mux.HandleFunc("GET /v1/candidates", a.listCandidates)
 
 	httpServer := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -162,6 +165,34 @@ func (a *api) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *api) listCandidates(w http.ResponseWriter, r *http.Request) {
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		return
+	}
+	if _, ok := a.registry.GetByToken(token); !ok {
+		http.Error(w, "invalid or expired session", http.StatusUnauthorized)
+		return
+	}
+	observed := a.relay.Candidates()
+	candidates := make([]p2p.Candidate, 0, len(observed))
+	for _, candidate := range observed {
+		peer, ok := a.registry.Get(candidate.NodeID)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, p2p.Candidate{
+			NodeID:     peer.NodeID,
+			VirtualIP:  peer.VirtualIP.String(),
+			Endpoint:   candidate.Endpoint,
+			Kind:       p2p.CandidateRelayObserved,
+			ObservedAt: candidate.ObservedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, candidates)
 }
 
 func bearerToken(header string) string {
