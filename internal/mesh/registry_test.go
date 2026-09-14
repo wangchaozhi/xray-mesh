@@ -22,6 +22,9 @@ func TestRegistryRegister(t *testing.T) {
 	if alpha.VirtualIP == beta.VirtualIP {
 		t.Fatalf("duplicate lease %s", alpha.VirtualIP)
 	}
+	if alpha.SessionToken == "" || alpha.SessionToken == beta.SessionToken {
+		t.Fatal("expected unique non-empty session tokens")
+	}
 
 	again, err := r.Register("alpha")
 	if err != nil {
@@ -29,6 +32,15 @@ func TestRegistryRegister(t *testing.T) {
 	}
 	if again != alpha {
 		t.Fatalf("registration is not idempotent: %#v != %#v", again, alpha)
+	}
+
+	byIP, ok := r.GetByVirtualIP(alpha.VirtualIP)
+	if !ok || byIP != alpha {
+		t.Fatalf("virtual IP lookup failed: %#v %v", byIP, ok)
+	}
+	byToken, ok := r.GetByToken(alpha.SessionToken)
+	if !ok || byToken != alpha {
+		t.Fatalf("token lookup failed: %#v %v", byToken, ok)
 	}
 }
 

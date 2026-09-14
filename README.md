@@ -9,17 +9,20 @@ The project is intentionally split into two responsibilities:
 
 ## Status
 
-Early prototype. The current tree provides a compilable control-plane skeleton:
+Early prototype. The current tree now provides a compilable control plane plus a Linux-only peer data-plane MVP:
 
 - client and server commands;
 - peer registration over HTTP;
 - deterministic virtual IPv4 allocation from `10.66.0.0/24`;
 - concurrency-safe peer registry;
 - packet/router interfaces;
-- TUN, discovery, and Xray adapter interfaces/stubs;
+- a Linux TUN implementation for overlay peer traffic;
+- a development UDP relay with per-registration session tokens and source-IP anti-spoofing;
+- packet classification for mesh, mDNS/SSDP discovery, and future Internet egress;
+- discovery and Xray adapter interfaces/stubs;
 - unit tests and GitHub Actions CI.
 
-It does **not** yet create a real TUN device or forward production traffic.
+The peer data plane is intentionally an MVP: the UDP relay is **not encrypted**, Internet egress is not wired to Xray yet, and the control plane is not production-authenticated.
 
 ## Architecture
 
@@ -28,7 +31,7 @@ It does **not** yet create a real TUN device or forward production traffic.
 |                                        |
 |  Apps                                  |
 |    |                                   |
-|   TUN  <-- future real device          |
+|   TUN  <-- Linux MVP device            |
 |    |                                   |
 |  Mesh Router                           |
 |    |\                                  |
@@ -45,7 +48,7 @@ It does **not** yet create a real TUN device or forward production traffic.
 ### Planned data plane
 
 ```text
-peer A (10.66.0.2) <---- encrypted transport ----> peer B (10.66.0.3)
+peer A (10.66.0.2) <---- coordinator UDP relay ----> peer B (10.66.0.3)
           \
            +---- Internet-bound packets ----> Xray/VLESS adapter ----> Internet
 ```
@@ -70,17 +73,31 @@ Discovery protocols such as mDNS and SSDP will be handled as explicit, bounded r
 
 ## Run the prototype
 
-Start the coordinator:
+Start the coordinator and UDP relay:
 
 ```bash
-go run ./cmd/server -listen 127.0.0.1:8666
+go run ./cmd/server \
+  -listen 0.0.0.0:8666 \
+  -relay-listen 0.0.0.0:8667
 ```
 
-Register a peer:
+A registration-only client still works without elevated privileges:
 
 ```bash
 go run ./cmd/client -server http://127.0.0.1:8666 -node laptop
 ```
+
+On Linux, enable the peer data plane with a TUN device (normally requires root or `CAP_NET_ADMIN`):
+
+```bash
+sudo go run ./cmd/client \
+  -server http://SERVER_IP:8666 \
+  -relay SERVER_IP:8667 \
+  -node laptop \
+  -tun
+```
+
+A second peer will receive another address in `10.66.0.0/24`; after both peers have started with `-tun`, traffic to their virtual IPs is relayed through the coordinator. The MVP does **not** route general Internet traffic into the TUN yet.
 
 Run tests:
 
@@ -102,9 +119,10 @@ go test ./...
 
 ### Phase 2 — data plane
 
-- [ ] real TUN implementation
-- [ ] packet classification
-- [ ] peer-to-peer packet transport
+- [x] Linux TUN implementation
+- [x] packet classification
+- [x] coordinator-relayed peer packet transport
+- [ ] direct peer-to-peer transport / NAT traversal
 - [ ] MTU and fragmentation strategy
 - [ ] NAT / egress policy
 
@@ -124,7 +142,7 @@ go test ./...
 
 ## Security model
 
-The current HTTP registration endpoint is development-only and unauthenticated. Do not expose it to the public Internet. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, and encrypted transport.
+The current HTTP registration endpoint is development-only and unauthenticated, and the UDP relay is not encrypted. Do not expose this prototype directly to untrusted networks. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, encrypted transport, token rotation, and stronger endpoint binding. The Xray integration point is intentionally separate so an existing secure transport can later carry the data plane without inventing a new obfuscation protocol.
 
 ## License
 
