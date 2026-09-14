@@ -10,6 +10,7 @@ import (
 
 	"github.com/wangchaozhi/xray-mesh/internal/p2p"
 	"github.com/wangchaozhi/xray-mesh/internal/packet"
+	"github.com/wangchaozhi/xray-mesh/internal/telemetry"
 )
 
 // SendDirectPayload attempts to send one mesh packet over a currently healthy
@@ -26,10 +27,12 @@ func (r *p2pRuntime) SendDirectPayload(destinationIP netip.Addr, payload []byte)
 	}
 	ticket, ok := r.liveTicketForPeer(candidate.NodeID, now)
 	if !ok {
+		telemetry.P2P.IncDirectFallback()
 		return false, nil
 	}
 	wire, err := p2p.SealDirectPayload(ticket, r.nodeID, candidate.NodeID, payload, now)
 	if err != nil {
+		telemetry.P2P.IncDirectFallback()
 		if errors.Is(err, p2p.ErrProbeTicketExpired) {
 			return false, nil
 		}
@@ -37,13 +40,16 @@ func (r *p2pRuntime) SendDirectPayload(destinationIP netip.Addr, payload []byte)
 	}
 	endpoint, err := net.ResolveUDPAddr("udp", selection.Endpoint)
 	if err != nil {
+		telemetry.P2P.IncDirectFallback()
 		r.selector.MarkDirectFailed(candidate.NodeID)
 		return false, err
 	}
 	if _, err := r.conn.WriteToUDP(wire, endpoint); err != nil {
+		telemetry.P2P.IncDirectFallback()
 		r.selector.MarkDirectFailed(candidate.NodeID)
 		return false, err
 	}
+	telemetry.P2P.IncDirectTX()
 	return true, nil
 }
 
@@ -87,11 +93,13 @@ func (r *p2pRuntime) HandleDirectPayload(data []byte, source *net.UDPAddr, local
 		return nil, true, err
 	}
 	if !r.acceptDirectReplayKey(replayKey, ticket.ExpiresAt, now) {
+		telemetry.P2P.IncReplayDrop()
 		return nil, true, ErrDirectPayloadReplay
 	}
 	if err := r.selector.MarkDirectHealthy(sourceNode, source.String(), now); err != nil {
 		return nil, true, err
 	}
+	telemetry.P2P.IncDirectRX()
 	return payload, true, nil
 }
 
