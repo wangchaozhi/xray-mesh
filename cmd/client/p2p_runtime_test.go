@@ -79,7 +79,7 @@ func TestForgedAckDoesNotConsumePendingProbe(t *testing.T) {
 		t.Fatal("valid ack did not consume pending probe")
 	}
 	selection := runtime.Selection("beta")
-	if selection.Path != p2p.PathDirect || selection.Endpoint != source.String() {
+	if selection.Kind != p2p.PathDirect || selection.Endpoint != source.String() {
 		t.Fatalf("selection=%#v, want direct %s", selection, source)
 	}
 }
