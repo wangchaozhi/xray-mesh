@@ -9,12 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
 
 const (
-	ProbeProtocol = "xray-mesh-p2p/1"
+	ProbeProtocol  = "xray-mesh-p2p/1"
 	ProbeTypeProbe = "probe"
 	ProbeTypeAck   = "probe_ack"
 )
@@ -104,7 +105,7 @@ func NewProbeAck(probe ProbeFrame, ticket ProbeTicket, now time.Time) (ProbeFram
 }
 
 func VerifyProbe(frame ProbeFrame, ticket ProbeTicket, now time.Time) error {
-	if err := validateProbeShape(frame); err != nil {
+	if err := validateSignedProbeShape(frame); err != nil {
 		return err
 	}
 	if frame.Type != ProbeTypeProbe {
@@ -120,7 +121,7 @@ func VerifyProbeAck(ack, probe ProbeFrame, ticket ProbeTicket, now time.Time) er
 	if err := VerifyProbe(probe, ticket, now); err != nil {
 		return err
 	}
-	if err := validateProbeShape(ack); err != nil {
+	if err := validateSignedProbeShape(ack); err != nil {
 		return err
 	}
 	if ack.Type != ProbeTypeAck || ack.SourceNode != probe.TargetNode || ack.TargetNode != probe.SourceNode || ack.Nonce != probe.Nonce || ack.TicketID != probe.TicketID {
@@ -156,7 +157,7 @@ func verifyProbeAuth(frame ProbeFrame, ticket ProbeTicket, now time.Time) error 
 }
 
 func MarshalProbeFrame(frame ProbeFrame) ([]byte, error) {
-	if err := validateProbeShape(frame); err != nil {
+	if err := validateSignedProbeShape(frame); err != nil {
 		return nil, err
 	}
 	body, err := json.Marshal(frame)
@@ -179,10 +180,11 @@ func ParseProbeFrame(data []byte) (ProbeFrame, error) {
 	if err := decoder.Decode(&frame); err != nil {
 		return ProbeFrame{}, fmt.Errorf("%w: %v", ErrInvalidProbeFrame, err)
 	}
-	if decoder.More() {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return ProbeFrame{}, ErrInvalidProbeFrame
 	}
-	if err := validateProbeShape(frame); err != nil {
+	if err := validateSignedProbeShape(frame); err != nil {
 		return ProbeFrame{}, err
 	}
 	return frame, nil
@@ -201,10 +203,15 @@ func validateProbeShape(frame ProbeFrame) error {
 	if decoded, err := hex.DecodeString(frame.Nonce); err != nil || len(decoded) != 16 {
 		return ErrInvalidProbeFrame
 	}
-	if frame.MAC != "" {
-		if decoded, err := hex.DecodeString(frame.MAC); err != nil || len(decoded) != sha256.Size {
-			return ErrInvalidProbeFrame
-		}
+	return nil
+}
+
+func validateSignedProbeShape(frame ProbeFrame) error {
+	if err := validateProbeShape(frame); err != nil {
+		return err
+	}
+	if decoded, err := hex.DecodeString(frame.MAC); err != nil || len(decoded) != sha256.Size {
+		return ErrInvalidProbeFrame
 	}
 	return nil
 }
