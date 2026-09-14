@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -38,6 +39,12 @@ type RelayOptions struct {
 	DiscoveryDedupWindow time.Duration
 }
 
+type ObservedCandidate struct {
+	NodeID     string    `json:"node_id"`
+	Endpoint   string    `json:"endpoint"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
 type peerRegistry interface {
 	GetByToken(string) (mesh.Peer, bool)
 	GetByVirtualIP(netip.Addr) (mesh.Peer, bool)
@@ -50,12 +57,17 @@ type discoveryPeerState struct {
 	seen       map[[32]byte]time.Time
 }
 
+type relayEndpoint struct {
+	addr       *net.UDPAddr
+	observedAt time.Time
+}
+
 type Relay struct {
 	registry peerRegistry
 	conn     *net.UDPConn
 
 	mu        sync.RWMutex
-	endpoints map[string]*net.UDPAddr
+	endpoints map[string]relayEndpoint
 
 	discoveryMu sync.Mutex
 	discovery   map[string]*discoveryPeerState
@@ -80,7 +92,7 @@ func ListenRelayWithOptions(addr string, registry peerRegistry, options RelayOpt
 	return &Relay{
 		registry:  registry,
 		conn:      conn,
-		endpoints: make(map[string]*net.UDPAddr),
+		endpoints: make(map[string]relayEndpoint),
 		discovery: make(map[string]*discoveryPeerState),
 		options:   options,
 		now:       time.Now,
@@ -103,7 +115,6 @@ func normalizeRelayOptions(options RelayOptions) RelayOptions {
 func (r *Relay) Addr() net.Addr { return r.conn.LocalAddr() }
 func (r *Relay) Close() error   { return r.conn.Close() }
 
-// ForgetPeer removes transport state that must not survive a lease expiry.
 func (r *Relay) ForgetPeer(nodeID string) {
 	r.mu.Lock()
 	delete(r.endpoints, nodeID)
@@ -112,6 +123,25 @@ func (r *Relay) ForgetPeer(nodeID string) {
 	r.discoveryMu.Lock()
 	delete(r.discovery, nodeID)
 	r.discoveryMu.Unlock()
+}
+
+// Candidates returns the coordinator-observed UDP source endpoint for every
+// peer that has sent a valid relay frame. These are server-reflexive candidates
+// learned opportunistically from the existing relay path; they are not proof
+// that direct connectivity is currently possible.
+func (r *Relay) Candidates() []ObservedCandidate {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]ObservedCandidate, 0, len(r.endpoints))
+	for nodeID, endpoint := range r.endpoints {
+		out = append(out, ObservedCandidate{
+			NodeID:     nodeID,
+			Endpoint:   endpoint.addr.String(),
+			ObservedAt: endpoint.observedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }
 
 func (r *Relay) Serve(ctx context.Context) error {
@@ -247,18 +277,18 @@ func (r *Relay) guardDiscovery(nodeID string, payload []byte) (bool, error) {
 func (r *Relay) bind(nodeID string, addr *net.UDPAddr) {
 	copyAddr := *addr
 	r.mu.Lock()
-	r.endpoints[nodeID] = &copyAddr
+	r.endpoints[nodeID] = relayEndpoint{addr: &copyAddr, observedAt: r.now().UTC()}
 	r.mu.Unlock()
 }
 
 func (r *Relay) endpoint(nodeID string) (*net.UDPAddr, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	addr, ok := r.endpoints[nodeID]
+	endpoint, ok := r.endpoints[nodeID]
 	if !ok {
 		return nil, false
 	}
-	copyAddr := *addr
+	copyAddr := *endpoint.addr
 	return &copyAddr, true
 }
 
