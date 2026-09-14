@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,18 +23,31 @@ type registerRequest struct {
 }
 
 type api struct {
-	registry *mesh.Registry
+	registry          *mesh.Registry
+	heartbeatInterval time.Duration
+	leaseTTL          time.Duration
 }
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8666", "HTTP listen address")
 	relayListen := flag.String("relay-listen", "127.0.0.1:8667", "UDP relay listen address")
 	prefixText := flag.String("prefix", "10.66.0.0/24", "virtual IPv4 prefix")
+	peerLease := flag.Duration("peer-lease", 60*time.Second, "peer lease TTL without a successful heartbeat")
+	heartbeatInterval := flag.Duration("heartbeat-interval", 15*time.Second, "heartbeat interval advertised to clients")
 	discoveryRate := flag.Float64("discovery-rate", 20, "sustained mDNS/SSDP packets per second allowed per peer")
 	discoveryBurst := flag.Int("discovery-burst", 40, "maximum mDNS/SSDP token-bucket burst per peer")
 	discoveryDedup := flag.Duration("discovery-dedup", 750*time.Millisecond, "suppress identical discovery packets from one peer during this window; 0 disables")
 	flag.Parse()
 
+	if *peerLease < time.Second {
+		log.Fatal("-peer-lease must be at least 1s")
+	}
+	if *heartbeatInterval < time.Second {
+		log.Fatal("-heartbeat-interval must be at least 1s")
+	}
+	if *heartbeatInterval >= *peerLease {
+		log.Fatal("-heartbeat-interval must be shorter than -peer-lease")
+	}
 	if *discoveryRate <= 0 {
 		log.Fatal("-discovery-rate must be greater than zero")
 	}
@@ -72,7 +86,9 @@ func main() {
 		}
 	}()
 
-	a := &api{registry: registry}
+	go runLeaseSweeper(ctx, registry, relay, *peerLease, *heartbeatInterval)
+
+	a := &api{registry: registry, heartbeatInterval: *heartbeatInterval, leaseTTL: *peerLease}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "text/plain; charset=utf-8")
@@ -80,6 +96,7 @@ func main() {
 	})
 	mux.HandleFunc("POST /v1/peers", a.registerPeer)
 	mux.HandleFunc("GET /v1/peers", a.listPeers)
+	mux.HandleFunc("POST /v1/heartbeat", a.heartbeat)
 
 	httpServer := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -89,9 +106,30 @@ func main() {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("xray-mesh coordinator HTTP=%s UDP=%s prefix=%s discovery_rate=%.1f/s discovery_burst=%d discovery_dedup=%s", *listen, relay.Addr(), prefix, *discoveryRate, *discoveryBurst, *discoveryDedup)
+	log.Printf("xray-mesh coordinator HTTP=%s UDP=%s prefix=%s peer_lease=%s heartbeat=%s discovery_rate=%.1f/s discovery_burst=%d discovery_dedup=%s", *listen, relay.Addr(), prefix, *peerLease, *heartbeatInterval, *discoveryRate, *discoveryBurst, *discoveryDedup)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
+	}
+}
+
+func runLeaseSweeper(ctx context.Context, registry *mesh.Registry, relay *transport.Relay, leaseTTL, heartbeatInterval time.Duration) {
+	interval := heartbeatInterval
+	if third := leaseTTL / 3; third > 0 && third < interval {
+		interval = third
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			expired := registry.ExpireBefore(now.UTC().Add(-leaseTTL))
+			for _, peer := range expired {
+				relay.ForgetPeer(peer.NodeID)
+				log.Printf("expired peer node=%s virtual_ip=%s", peer.NodeID, peer.VirtualIP)
+			}
+		}
 	}
 }
 
@@ -107,7 +145,39 @@ func (a *api) registerPeer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusCreated, peer.Registration(a.registry.Prefix()))
+	registration := peer.Registration(a.registry.Prefix())
+	registration.HeartbeatIntervalSeconds = durationSeconds(a.heartbeatInterval)
+	registration.LeaseTTLSeconds = durationSeconds(a.leaseTTL)
+	writeJSON(w, http.StatusCreated, registration)
+}
+
+func (a *api) heartbeat(w http.ResponseWriter, r *http.Request) {
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		return
+	}
+	if _, ok := a.registry.TouchByToken(token, time.Now().UTC()); !ok {
+		http.Error(w, "invalid or expired session", http.StatusUnauthorized)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func bearerToken(header string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
+}
+
+func durationSeconds(d time.Duration) int {
+	seconds := int(d / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func (a *api) listPeers(w http.ResponseWriter, _ *http.Request) {
