@@ -17,3 +17,17 @@ func DirectPayloadTicketID(data []byte) (string, error) {
 	}
 	return hex.EncodeToString(data[8:40]), nil
 }
+
+// DirectPayloadReplayKey returns a stable identifier for one encrypted
+// datagram: public ticket ID plus the per-datagram GCM nonce. Receivers can use
+// it only after successful authentication to reject replay of a previously
+// accepted ciphertext during the ticket lifetime.
+func DirectPayloadReplayKey(data []byte) (string, error) {
+	if !bytes.HasPrefix(data, directPayloadPrefix) {
+		return "", ErrNotDirectPayload
+	}
+	if len(data) < directPayloadHeaderLen {
+		return "", ErrInvalidDirectPayload
+	}
+	return hex.EncodeToString(data[8:52]), nil
+}
