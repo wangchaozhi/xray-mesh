@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -38,14 +39,24 @@ func run() error {
 	relayAddr := flag.String("relay", "127.0.0.1:8667", "UDP relay address")
 	nodeID := flag.String("node", "", "unique node ID")
 	enableTUN := flag.Bool("tun", false, "enable the Linux TUN peer data plane")
-	tunName := flag.String("tun-name", "xrmesh0", "TUN interface name")
+	tunName := flag.String("tun-name", "xrmesh0", "mesh TUN interface name")
 	xrayBinary := flag.String("xray-bin", "xray", "path to the Xray Core binary")
 	xrayConfig := flag.String("xray-config", "", "path to an existing Xray JSON config; empty disables Xray supervision")
+	fullTunnel := flag.Bool("full-tunnel", false, "generate a temporary IPv4 Xray TUN profile and route Internet traffic through Xray")
+	xrayTUNName := flag.String("xray-tun-name", "xraymesh0", "interface name for generated Xray full-tunnel TUN")
+	xrayTUNGateway := flag.String("xray-tun-gateway", "172.30.255.1/30", "gateway prefix for generated Xray full-tunnel TUN")
+	xrayTUNMTU := flag.Int("xray-tun-mtu", 1500, "MTU for generated Xray full-tunnel TUN")
 	statusListen := flag.String("status-listen", "", "local runtime status HTTP address, for example 127.0.0.1:8670; empty disables")
 	flag.Parse()
 
 	if strings.TrimSpace(*nodeID) == "" {
 		return errors.New("-node is required")
+	}
+	if *fullTunnel && strings.TrimSpace(*xrayConfig) == "" {
+		return errors.New("-full-tunnel requires -xray-config")
+	}
+	if *xrayTUNMTU <= 0 {
+		return errors.New("-xray-tun-mtu must be greater than zero")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -75,10 +86,41 @@ func run() error {
 		log.Printf("runtime status listening on http://%s", *statusListen)
 	}
 
+	effectiveXrayConfig := *xrayConfig
+	if *fullTunnel {
+		meshPrefix, err := netip.ParsePrefix(registration.NetworkPrefix)
+		if err != nil {
+			return fmt.Errorf("invalid mesh prefix from coordinator: %w", err)
+		}
+		gateway, err := netip.ParsePrefix(*xrayTUNGateway)
+		if err != nil || !gateway.Addr().Is4() {
+			if err != nil {
+				return fmt.Errorf("invalid -xray-tun-gateway: %w", err)
+			}
+			return errors.New("-xray-tun-gateway must be an IPv4 prefix")
+		}
+		protected, err := resolveProtectedPrefixes(ctx, *server, *relayAddr, meshPrefix)
+		if err != nil {
+			return err
+		}
+		generated, cleanup, err := xraycore.WriteFullTunnelConfig(*xrayConfig, xraycore.TunnelProfileOptions{
+			Name:      *xrayTUNName,
+			MTU:       *xrayTUNMTU,
+			Gateway:   gateway,
+			Protected: protected,
+		})
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		effectiveXrayConfig = generated
+		log.Printf("generated IPv4 Xray full-tunnel profile name=%s protected_prefixes=%d", *xrayTUNName, len(protected))
+	}
+
 	var xrayWait <-chan error
 	var xrayProcess *xraycore.Process
 	if xrayEnabled {
-		xrayProcess = xraycore.NewProcess(*xrayBinary, *xrayConfig)
+		xrayProcess = xraycore.NewProcess(*xrayBinary, effectiveXrayConfig)
 		xrayProcess.Stdout = os.Stdout
 		xrayProcess.Stderr = os.Stderr
 		if err := xrayProcess.Validate(ctx); err != nil {
@@ -98,7 +140,7 @@ func run() error {
 			waitCh <- xrayProcess.Wait()
 			close(waitCh)
 		}()
-		log.Printf("Xray supervisor started binary=%s config=%s", *xrayBinary, *xrayConfig)
+		log.Printf("Xray supervisor started binary=%s full_tunnel=%t", *xrayBinary, *fullTunnel)
 	}
 
 	var tunWait <-chan error
@@ -204,6 +246,71 @@ func register(server, nodeID string) (mesh.RegistrationView, error) {
 	return registration, nil
 }
 
+func resolveProtectedPrefixes(ctx context.Context, serverURL, relayAddr string, meshPrefix netip.Prefix) ([]netip.Prefix, error) {
+	if !meshPrefix.IsValid() || !meshPrefix.Addr().Is4() {
+		return nil, errors.New("mesh prefix must be valid IPv4")
+	}
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse coordinator URL: %w", err)
+	}
+	coordinatorHost := parsed.Hostname()
+	if coordinatorHost == "" {
+		return nil, errors.New("coordinator URL has no hostname")
+	}
+	relayHost, _, err := net.SplitHostPort(relayAddr)
+	if err != nil {
+		return nil, fmt.Errorf("parse relay address: %w", err)
+	}
+
+	result := []netip.Prefix{meshPrefix.Masked()}
+	for _, host := range []string{coordinatorHost, relayHost} {
+		prefixes, err := resolveHostIPv4(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, prefixes...)
+	}
+
+	seen := make(map[string]struct{}, len(result))
+	unique := make([]netip.Prefix, 0, len(result))
+	for _, prefix := range result {
+		prefix = prefix.Masked()
+		key := prefix.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, prefix)
+	}
+	return unique, nil
+}
+
+func resolveHostIPv4(ctx context.Context, host string) ([]netip.Prefix, error) {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return nil, errors.New("empty protected hostname")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Is4() {
+			return []netip.Prefix{netip.PrefixFrom(addr, 32)}, nil
+		}
+		return nil, nil
+	}
+
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve protected host %q: %w", host, err)
+	}
+	prefixes := make([]netip.Prefix, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr.Is4() {
+			prefixes = append(prefixes, netip.PrefixFrom(addr, 32))
+		}
+	}
+	return prefixes, nil
+}
+
 func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, tunName string, onReady func()) error {
 	virtualIP, err := netip.ParseAddr(registration.VirtualIP)
 	if err != nil {
@@ -248,7 +355,7 @@ func runTUN(ctx context.Context, registration mesh.RegistrationView, relayAddr, 
 	if onReady != nil {
 		onReady()
 	}
-	log.Printf("mesh TUN=%s addr=%s relay=%s; Internet traffic remains outside the mesh TUN", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote)
+	log.Printf("mesh TUN=%s addr=%s relay=%s", dev.Name(), netip.PrefixFrom(virtualIP, networkPrefix.Bits()), remote)
 	return pump(ctx, dev, conn, registration.SessionToken, networkPrefix)
 }
 
