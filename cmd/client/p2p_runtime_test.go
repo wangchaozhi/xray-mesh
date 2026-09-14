@@ -16,7 +16,7 @@ func TestForgedAckDoesNotConsumePendingProbe(t *testing.T) {
 	}
 	defer conn.Close()
 
-	now := time.Unix(1000, 0).UTC()
+	now := time.Now().UTC()
 	ticket := p2p.ProbeTicket{
 		Ticket:     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		SourceNode: "alpha",
