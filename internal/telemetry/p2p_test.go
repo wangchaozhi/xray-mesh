@@ -4,7 +4,7 @@ import "testing"
 
 func TestP2PCountersSnapshot(t *testing.T) {
 	var counters P2PCounters
-	counters.IncProbeHealthy()
+	counters.IncDirectHealthy()
 	counters.IncDirectTX()
 	counters.IncDirectTX()
 	counters.IncDirectRX()
@@ -12,7 +12,7 @@ func TestP2PCountersSnapshot(t *testing.T) {
 	counters.IncReplayDrop()
 
 	snap := counters.Snapshot()
-	if snap.ProbeHealthy != 1 || snap.DirectTX != 2 || snap.DirectRX != 1 || snap.DirectFallbacks != 1 || snap.ReplayDrops != 1 {
+	if snap.DirectHealthyMarks != 1 || snap.DirectTX != 2 || snap.DirectRX != 1 || snap.DirectFallbacks != 1 || snap.ReplayDrops != 1 {
 		t.Fatalf("unexpected snapshot: %+v", snap)
 	}
 }
