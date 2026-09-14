@@ -35,12 +35,12 @@ type pendingProbe struct {
 }
 
 type p2pRuntime struct {
-	server  string
-	nodeID  string
-	token   string
-	conn    *net.UDPConn
-	relay   *net.UDPAddr
-	client  *http.Client
+	server   string
+	nodeID   string
+	token    string
+	conn     *net.UDPConn
+	relay    *net.UDPAddr
+	client   *http.Client
 	selector *p2p.Selector
 
 	mu         sync.RWMutex
@@ -113,13 +113,14 @@ func (r *p2pRuntime) HandleDatagram(data []byte, source *net.UDPAddr) error {
 		return nil
 
 	case p2p.ProbeTypeAck:
-		pending, ok := r.takePending(frame.Nonce)
+		pending, ok := r.peekPending(frame.Nonce)
 		if !ok {
 			return errors.New("P2P probe ack has no matching pending nonce")
 		}
 		if err := p2p.VerifyProbeAck(frame, pending.probe, pending.ticket, now); err != nil {
 			return err
 		}
+		r.deletePending(frame.Nonce)
 		if err := r.selector.MarkDirectHealthy(pending.target, source.String(), now); err != nil {
 			return err
 		}
@@ -410,12 +411,15 @@ func (r *p2pRuntime) ticketForID(ticketID string) (p2p.ProbeTicket, bool) {
 	return ticket, ok
 }
 
-func (r *p2pRuntime) takePending(nonce string) (pendingProbe, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *p2pRuntime) peekPending(nonce string) (pendingProbe, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	pending, ok := r.pending[nonce]
-	if ok {
-		delete(r.pending, nonce)
-	}
 	return pending, ok
+}
+
+func (r *p2pRuntime) deletePending(nonce string) {
+	r.mu.Lock()
+	delete(r.pending, nonce)
+	r.mu.Unlock()
 }
