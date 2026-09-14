@@ -29,7 +29,20 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8666", "HTTP listen address")
 	relayListen := flag.String("relay-listen", "127.0.0.1:8667", "UDP relay listen address")
 	prefixText := flag.String("prefix", "10.66.0.0/24", "virtual IPv4 prefix")
+	discoveryRate := flag.Float64("discovery-rate", 20, "sustained mDNS/SSDP packets per second allowed per peer")
+	discoveryBurst := flag.Int("discovery-burst", 40, "maximum mDNS/SSDP token-bucket burst per peer")
+	discoveryDedup := flag.Duration("discovery-dedup", 750*time.Millisecond, "suppress identical discovery packets from one peer during this window; 0 disables")
 	flag.Parse()
+
+	if *discoveryRate <= 0 {
+		log.Fatal("-discovery-rate must be greater than zero")
+	}
+	if *discoveryBurst <= 0 {
+		log.Fatal("-discovery-burst must be greater than zero")
+	}
+	if *discoveryDedup < 0 {
+		log.Fatal("-discovery-dedup must not be negative")
+	}
 
 	prefix, err := netip.ParsePrefix(*prefixText)
 	if err != nil {
@@ -43,7 +56,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	relay, err := transport.ListenRelay(*relayListen, registry)
+	relay, err := transport.ListenRelayWithOptions(*relayListen, registry, transport.RelayOptions{
+		DiscoveryRate:        *discoveryRate,
+		DiscoveryBurst:       *discoveryBurst,
+		DiscoveryDedupWindow: *discoveryDedup,
+	})
 	if err != nil {
 		log.Fatalf("UDP relay: %v", err)
 	}
@@ -72,7 +89,7 @@ func main() {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("xray-mesh coordinator HTTP=%s UDP=%s prefix=%s", *listen, relay.Addr(), prefix)
+	log.Printf("xray-mesh coordinator HTTP=%s UDP=%s prefix=%s discovery_rate=%.1f/s discovery_burst=%d discovery_dedup=%s", *listen, relay.Addr(), prefix, *discoveryRate, *discoveryBurst, *discoveryDedup)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

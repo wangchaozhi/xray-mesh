@@ -113,6 +113,69 @@ func TestRelayBroadcastsMDNS(t *testing.T) {
 	}
 }
 
+func TestDiscoveryGuardDedupDoesNotConsumeTokens(t *testing.T) {
+	registry, _ := mesh.NewRegistry(netip.MustParsePrefix("10.66.0.0/24"))
+	relay, err := ListenRelayWithOptions("127.0.0.1:0", registry, RelayOptions{
+		DiscoveryRate:        1,
+		DiscoveryBurst:       1,
+		DiscoveryDedupWindow: 750 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+
+	now := time.Unix(100, 0)
+	relay.now = func() time.Time { return now }
+	first := udpIPv4Packet(netip.MustParseAddr("10.66.0.2"), mdnsMulticast, 5353, 5353)
+
+	duplicate, err := relay.guardDiscovery("alpha", first)
+	if err != nil || duplicate {
+		t.Fatalf("first packet duplicate=%v err=%v", duplicate, err)
+	}
+	duplicate, err = relay.guardDiscovery("alpha", first)
+	if err != nil || !duplicate {
+		t.Fatalf("second identical packet duplicate=%v err=%v", duplicate, err)
+	}
+
+	second := append([]byte(nil), first...)
+	second = append(second, 0x01)
+	duplicate, err = relay.guardDiscovery("alpha", second)
+	if duplicate || !errors.Is(err, ErrDiscoveryRateLimited) {
+		t.Fatalf("new packet duplicate=%v err=%v, want rate limited", duplicate, err)
+	}
+
+	now = now.Add(time.Second)
+	duplicate, err = relay.guardDiscovery("alpha", second)
+	if err != nil || duplicate {
+		t.Fatalf("refilled packet duplicate=%v err=%v", duplicate, err)
+	}
+}
+
+func TestDiscoveryGuardIsPerPeer(t *testing.T) {
+	registry, _ := mesh.NewRegistry(netip.MustParsePrefix("10.66.0.0/24"))
+	relay, err := ListenRelayWithOptions("127.0.0.1:0", registry, RelayOptions{
+		DiscoveryRate:        1,
+		DiscoveryBurst:       1,
+		DiscoveryDedupWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+
+	now := time.Unix(200, 0)
+	relay.now = func() time.Time { return now }
+	payload := udpIPv4Packet(netip.MustParseAddr("10.66.0.2"), mdnsMulticast, 5353, 5353)
+
+	if duplicate, err := relay.guardDiscovery("alpha", payload); err != nil || duplicate {
+		t.Fatalf("alpha duplicate=%v err=%v", duplicate, err)
+	}
+	if duplicate, err := relay.guardDiscovery("beta", payload); err != nil || duplicate {
+		t.Fatalf("beta duplicate=%v err=%v", duplicate, err)
+	}
+}
+
 func TestRelayRejectsWrongDiscoveryPort(t *testing.T) {
 	registry, _ := mesh.NewRegistry(netip.MustParsePrefix("10.66.0.0/24"))
 	alpha, _ := registry.Register("alpha")
