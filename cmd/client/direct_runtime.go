@@ -82,6 +82,13 @@ func (r *p2pRuntime) HandleDirectPayload(data []byte, source *net.UDPAddr, local
 	if sourceIP != expectedSourceIP || destinationIP != localVirtualIP {
 		return nil, true, fmt.Errorf("direct payload virtual IP mismatch src=%s want=%s dst=%s want=%s", sourceIP, expectedSourceIP, destinationIP, localVirtualIP)
 	}
+	replayKey, err := p2p.DirectPayloadReplayKey(data)
+	if err != nil {
+		return nil, true, err
+	}
+	if !r.acceptDirectReplayKey(replayKey, ticket.ExpiresAt, now) {
+		return nil, true, ErrDirectPayloadReplay
+	}
 	if err := r.selector.MarkDirectHealthy(sourceNode, source.String(), now); err != nil {
 		return nil, true, err
 	}
