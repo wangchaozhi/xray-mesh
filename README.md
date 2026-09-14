@@ -9,7 +9,7 @@ The project is intentionally split into two responsibilities:
 
 ## Status
 
-Early prototype. The current tree provides a control plane, a Linux-only peer data-plane MVP, and an Xray process supervisor:
+Early prototype. The current tree provides a control plane, a Linux-only peer data-plane MVP, Xray process supervision, and an optional local runtime-status API:
 
 - client and server commands;
 - peer registration over HTTP;
@@ -19,6 +19,7 @@ Early prototype. The current tree provides a control plane, a Linux-only peer da
 - development UDP relay with per-registration session tokens and source-IP anti-spoofing;
 - packet classification for mesh, mDNS/SSDP discovery, and future Internet egress;
 - Xray config validation plus child-process lifecycle supervision;
+- `/healthz` and `/v1/status` runtime endpoints for mesh/Xray state;
 - unit tests and GitHub Actions CI.
 
 The peer data plane is intentionally an MVP: the UDP relay is **not encrypted**, general Internet traffic is not routed into the mesh TUN, and the control plane is not production-authenticated.
@@ -33,6 +34,8 @@ The peer data plane is intentionally an MVP: the UDP relay is **not encrypted**,
 | mesh TUN ----> peer/discovery traffic ----------+--> mesh relay
 |                                                 |
 | Xray supervisor --> existing Xray Core ---------+--> Internet
+|                                                 |
+| local status API --> mesh/Xray health           |
 +-------------------------------------------------+
                          |
                     coordinator
@@ -48,8 +51,9 @@ The current design deliberately keeps the mesh TUN scoped to the overlay prefix.
 2. Each peer receives a virtual IP.
 3. Overlay peer traffic is routed through the mesh data plane.
 4. The same client can supervise an existing Xray Core instance for Internet egress.
-5. Selected discovery traffic can later be relayed across the overlay.
-6. Keep the mesh layer transport-agnostic so the underlying tunnel can evolve independently.
+5. Runtime health is observable before more complex transparent routing is added.
+6. Selected discovery traffic can later be relayed across the overlay.
+7. Keep the mesh layer transport-agnostic so the underlying tunnel can evolve independently.
 
 ## Non-goals
 
@@ -93,10 +97,20 @@ sudo go run ./cmd/client \
   -node laptop \
   -tun \
   -xray-bin /usr/local/bin/xray \
-  -xray-config /etc/xray/config.json
+  -xray-config /etc/xray/config.json \
+  -status-listen 127.0.0.1:8670
 ```
 
 Before starting Xray, `xray-mesh` runs Xray's config test command. If the child process exits unexpectedly, the client reports the failure instead of silently continuing. `SIGINT`/`SIGTERM` is shared across the mesh and Xray lifecycle.
+
+When `-status-listen` is set, the client exposes:
+
+```text
+GET /healthz
+GET /v1/status
+```
+
+`/healthz` returns HTTP 200 only when every enabled runtime service is in the `running` state; otherwise it returns 503. The status listener is disabled by default and should normally be bound to loopback while the project is in prototype stage.
 
 At this stage Xray and the mesh are managed by one client process, but Internet packets are **not yet injected into Xray by the mesh TUN**. Existing Xray system proxy/TUN configuration can continue to provide Internet egress independently while `xrmesh0` carries only overlay traffic.
 
@@ -131,6 +145,7 @@ go test ./...
 
 - [x] Xray process supervisor
 - [x] config validation and lifecycle monitoring
+- [x] runtime health/status reporting
 - [ ] generated Xray configuration/profile model
 - [ ] SOCKS/transparent egress adapter
 - [ ] policy routing for selected destinations
@@ -145,7 +160,7 @@ go test ./...
 
 ## Security model
 
-The current HTTP registration endpoint is development-only and unauthenticated, and the UDP relay is not encrypted. Do not expose this prototype directly to untrusted networks. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, encrypted transport, token rotation, and stronger endpoint binding. The Xray integration intentionally uses an existing Xray binary/config instead of inventing a new transport or obfuscation protocol.
+The current HTTP registration endpoint is development-only and unauthenticated, and the UDP relay is not encrypted. Do not expose this prototype directly to untrusted networks. A production version needs authenticated peer identity, replay protection, authorization, lease expiry, encrypted transport, token rotation, and stronger endpoint binding. The Xray integration intentionally uses an existing Xray binary/config instead of inventing a new transport or obfuscation protocol. The runtime status endpoint is also development-oriented and should not be exposed publicly without authentication.
 
 ## License
 
