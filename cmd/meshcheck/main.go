@@ -59,16 +59,16 @@ type phaseResult struct {
 }
 
 type report struct {
-	NodeID      string                `json:"node_id"`
-	VirtualIP   string                `json:"virtual_ip"`
-	PeerIP      string                `json:"peer_ip"`
-	StatusURL   string                `json:"status_url"`
-	Relay       string                `json:"relay,omitempty"`
-	StartedAt   time.Time             `json:"started_at"`
-	FinishedAt  time.Time             `json:"finished_at"`
-	Passed      bool                  `json:"passed"`
-	Phases      []phaseResult         `json:"phases"`
-	FinalP2P    telemetry.P2PSnapshot `json:"final_p2p"`
+	NodeID     string                `json:"node_id"`
+	VirtualIP  string                `json:"virtual_ip"`
+	PeerIP     string                `json:"peer_ip"`
+	StatusURL  string                `json:"status_url"`
+	Relay      string                `json:"relay,omitempty"`
+	StartedAt  time.Time             `json:"started_at"`
+	FinishedAt time.Time             `json:"finished_at"`
+	Passed     bool                  `json:"passed"`
+	Phases     []phaseResult         `json:"phases"`
+	FinalP2P   telemetry.P2PSnapshot `json:"final_p2p"`
 }
 
 type checker struct {
@@ -85,10 +85,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	c := &checker{
-		cfg: cfg,
-		client: &http.Client{Timeout: 3 * time.Second},
-	}
+	c := &checker{cfg: cfg, client: &http.Client{Timeout: 3 * time.Second}}
 	rep, runErr := c.run(ctx)
 	if cfg.jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
@@ -106,7 +103,7 @@ func main() {
 func parseFlags() (config, error) {
 	statusURL := flag.String("status", "http://127.0.0.1:8670/v1/status", "local client status endpoint")
 	peer := flag.String("peer", "", "peer mesh IPv4 address, for example 10.66.0.3")
-	samples := flag.Int("samples", 5, "ping samples per measurement phase")
+	samples := flag.Int("samples", 5, "successful ping samples per measurement phase")
 	pingTimeout := flag.Duration("ping-timeout", 2*time.Second, "timeout for one ping")
 	pollInterval := flag.Duration("poll-interval", time.Second, "interval while waiting for path transitions")
 	directTimeout := flag.Duration("direct-timeout", 25*time.Second, "maximum time to observe encrypted direct TX")
@@ -122,15 +119,18 @@ func parseFlags() (config, error) {
 	if err != nil || !peerIP.Is4() {
 		return config{}, errors.New("-peer must be a valid IPv4 mesh address")
 	}
+	if strings.TrimSpace(*statusURL) == "" {
+		return config{}, errors.New("-status must not be empty")
+	}
 	if *samples <= 0 {
 		return config{}, errors.New("-samples must be greater than zero")
 	}
 	for name, d := range map[string]time.Duration{
-		"-ping-timeout": *pingTimeout,
-		"-poll-interval": *pollInterval,
-		"-direct-timeout": *directTimeout,
+		"-ping-timeout":     *pingTimeout,
+		"-poll-interval":    *pollInterval,
+		"-direct-timeout":   *directTimeout,
 		"-fallback-timeout": *fallbackTimeout,
-		"-fallback-quiet": *fallbackQuiet,
+		"-fallback-quiet":   *fallbackQuiet,
 		"-recovery-timeout": *recoveryTimeout,
 	} {
 		if d <= 0 {
@@ -157,23 +157,19 @@ func parseFlags() (config, error) {
 }
 
 func (c *checker) run(ctx context.Context) (report, error) {
-	rep := report{
-		PeerIP:    c.cfg.peerIP.String(),
-		StatusURL: c.cfg.statusURL,
-		Relay:     c.cfg.relayAddr,
-		StartedAt: time.Now().UTC(),
+	rep := report{PeerIP: c.cfg.peerIP.String(), StatusURL: c.cfg.statusURL, Relay: c.cfg.relayAddr, StartedAt: time.Now().UTC()}
+	if _, err := exec.LookPath("ping"); err != nil {
+		return c.finish(rep, errors.New("ping command not found"))
 	}
 
 	status, err := c.readStatus(ctx)
 	if err != nil {
-		rep.FinishedAt = time.Now().UTC()
-		return rep, fmt.Errorf("read local status: %w", err)
+		return c.finish(rep, fmt.Errorf("read local status: %w", err))
 	}
 	rep.NodeID = status.NodeID
 	rep.VirtualIP = status.VirtualIP
 	if !status.Mesh.Enabled || status.Mesh.State != health.StateRunning {
-		rep.FinishedAt = time.Now().UTC()
-		return rep, fmt.Errorf("mesh service is not running: enabled=%t state=%s", status.Mesh.Enabled, status.Mesh.State)
+		return c.finish(rep, fmt.Errorf("mesh service is not running: enabled=%t state=%s", status.Mesh.Enabled, status.Mesh.State))
 	}
 
 	baseline, err := c.measurePhase(ctx, "baseline-connectivity", c.cfg.samples, "mesh peer must be reachable before path validation")
@@ -194,7 +190,6 @@ func (c *checker) run(ctx context.Context) (report, error) {
 		if fallbackErr != nil {
 			return c.finish(rep, fallbackErr)
 		}
-
 		recovery, recoveryErr := c.waitForDirect(ctx, "direct-recovery", c.cfg.recoveryTimeout)
 		rep.Phases = append(rep.Phases, recovery)
 		if recoveryErr != nil {
@@ -222,21 +217,9 @@ func (c *checker) measurePhase(ctx context.Context, name string, count int, note
 	if err != nil {
 		return phaseResult{Name: name, Note: note}, err
 	}
-	rtts := make([]time.Duration, 0, count)
-	for i := 0; i < count; i++ {
-		rtt, pingErr := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
-		if pingErr == nil {
-			rtts = append(rtts, rtt)
-		}
-	}
+	rtts, attempts := c.collectPings(ctx, count, count)
 	after, statusErr := c.readStatus(ctx)
-	phase := phaseResult{
-		Name:           name,
-		DurationMS:     time.Since(start).Milliseconds(),
-		Ping:           summarizePings(count, rtts),
-		CountersBefore: before.P2P,
-		Note:           note,
-	}
+	phase := phaseResult{Name: name, DurationMS: time.Since(start).Milliseconds(), Ping: summarizePings(attempts, rtts), CountersBefore: before.P2P, Note: note}
 	if statusErr == nil {
 		phase.CountersAfter = after.P2P
 	}
@@ -256,57 +239,45 @@ func (c *checker) waitForDirect(ctx context.Context, name string, timeout time.D
 	if err != nil {
 		return phaseResult{Name: name}, err
 	}
-	deadline := time.Now().Add(timeout)
+	phaseCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	rtts := make([]time.Duration, 0, c.cfg.samples)
 	attempts := 0
 
-	for time.Now().Before(deadline) {
-		if err := ctx.Err(); err != nil {
-			return phaseResult{Name: name}, err
-		}
+	for phaseCtx.Err() == nil {
 		attempts++
-		rtt, pingErr := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
+		rtt, pingErr := pingOnce(phaseCtx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
 		if pingErr == nil {
 			rtts = append(rtts, rtt)
 		}
-		status, statusErr := c.readStatus(ctx)
+		status, statusErr := c.readStatus(phaseCtx)
 		if statusErr != nil {
+			if phaseCtx.Err() != nil {
+				break
+			}
 			return phaseResult{Name: name}, statusErr
 		}
 		if status.P2P.DirectTX > before.P2P.DirectTX && len(rtts) > 0 {
-			for len(rtts) < c.cfg.samples {
-				attempts++
-				moreRTT, moreErr := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
-				if moreErr == nil {
-					rtts = append(rtts, moreRTT)
-				}
+			need := c.cfg.samples - len(rtts)
+			if need > 0 {
+				more, moreAttempts := c.collectPings(phaseCtx, need, need*2)
+				attempts += moreAttempts
+				rtts = append(rtts, more...)
 			}
-			after, _ := c.readStatus(ctx)
-			phase := phaseResult{
-				Name:           name,
-				Passed:         true,
-				DurationMS:     time.Since(start).Milliseconds(),
-				Ping:           summarizePings(attempts, rtts),
-				CountersBefore: before.P2P,
-				CountersAfter:  after.P2P,
-				Note:           "direct_tx increased while peer traffic remained reachable",
+			after, _ := c.readStatus(context.Background())
+			phase := phaseResult{Name: name, DurationMS: time.Since(start).Milliseconds(), Ping: summarizePings(attempts, rtts), CountersBefore: before.P2P, CountersAfter: after.P2P, Note: "direct_tx increased while peer traffic remained reachable"}
+			phase.Passed = len(rtts) >= c.cfg.samples
+			if !phase.Passed {
+				return phase, fmt.Errorf("%s: direct path observed but only %d/%d successful ping samples were collected", name, len(rtts), c.cfg.samples)
 			}
 			return phase, nil
 		}
-		if err := sleepContext(ctx, c.cfg.pollInterval); err != nil {
-			return phaseResult{Name: name}, err
+		if err := sleepContext(phaseCtx, c.cfg.pollInterval); err != nil {
+			break
 		}
 	}
-	after, _ := c.readStatus(ctx)
-	phase := phaseResult{
-		Name:           name,
-		Passed:         false,
-		DurationMS:     time.Since(start).Milliseconds(),
-		Ping:           summarizePings(attempts, rtts),
-		CountersBefore: before.P2P,
-		CountersAfter:  after.P2P,
-		Note:           "timed out waiting for direct_tx to increase",
-	}
+	after, _ := c.readStatus(context.Background())
+	phase := phaseResult{Name: name, Passed: false, DurationMS: time.Since(start).Milliseconds(), Ping: summarizePings(attempts, rtts), CountersBefore: before.P2P, CountersAfter: after.P2P, Note: "timed out waiting for direct_tx to increase"}
 	return phase, fmt.Errorf("%s: direct path not observed within %s", name, timeout)
 }
 
@@ -320,26 +291,31 @@ func (c *checker) verifyFallback(ctx context.Context) (phaseResult, error) {
 	if err != nil {
 		return phaseResult{Name: "relay-fallback", CountersBefore: before.P2P}, err
 	}
+	closed := false
 	defer func() {
+		if closed {
+			return
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = fw.Close(cleanupCtx)
 	}()
 
-	deadline := time.Now().Add(c.cfg.fallbackTimeout)
+	phaseCtx, cancel := context.WithTimeout(ctx, c.cfg.fallbackTimeout)
+	defer cancel()
 	lastDirectTX := before.P2P.DirectTX
 	lastDirectChange := time.Now()
 	attempts := 0
-	rtts := make([]time.Duration, 0, c.cfg.samples)
+	rtts := make([]time.Duration, 0, c.cfg.samples+1)
 
-	for time.Now().Before(deadline) {
-		if err := ctx.Err(); err != nil {
-			return phaseResult{Name: "relay-fallback"}, err
-		}
+	for phaseCtx.Err() == nil {
 		attempts++
-		rtt, pingErr := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
-		status, statusErr := c.readStatus(ctx)
+		rtt, pingErr := pingOnce(phaseCtx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
+		status, statusErr := c.readStatus(phaseCtx)
 		if statusErr != nil {
+			if phaseCtx.Err() != nil {
+				break
+			}
 			return phaseResult{Name: "relay-fallback"}, statusErr
 		}
 		if status.P2P.DirectTX != lastDirectTX {
@@ -348,55 +324,59 @@ func (c *checker) verifyFallback(ctx context.Context) (phaseResult, error) {
 		}
 		if pingErr == nil && time.Since(lastDirectChange) >= c.cfg.fallbackQuiet {
 			confirmBefore := status.P2P.DirectTX
-			confirmSuccess := 0
-			for i := 0; i < c.cfg.samples; i++ {
-				attempts++
-				confirmRTT, confirmErr := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
-				if confirmErr == nil {
-					confirmSuccess++
-					rtts = append(rtts, confirmRTT)
-				}
-			}
-			confirmStatus, confirmStatusErr := c.readStatus(ctx)
+			confirmRTTs, confirmAttempts := c.collectPings(phaseCtx, c.cfg.samples, c.cfg.samples)
+			attempts += confirmAttempts
+			rtts = append(rtts, rtt)
+			rtts = append(rtts, confirmRTTs...)
+			confirmStatus, confirmStatusErr := c.readStatus(phaseCtx)
 			if confirmStatusErr != nil {
 				return phaseResult{Name: "relay-fallback"}, confirmStatusErr
 			}
-			if confirmSuccess == c.cfg.samples && confirmStatus.P2P.DirectTX == confirmBefore {
-				phase := phaseResult{
-					Name:           "relay-fallback",
-					Passed:         true,
-					DurationMS:     time.Since(start).Milliseconds(),
-					Ping:           summarizePings(attempts, rtts),
-					CountersBefore: before.P2P,
-					CountersAfter:  confirmStatus.P2P,
-					Note:           "peer stayed reachable while direct_tx remained unchanged with non-relay UDP blocked",
-				}
-				if cleanupErr := fw.Close(context.Background()); cleanupErr != nil {
+			if len(confirmRTTs) == c.cfg.samples && confirmStatus.P2P.DirectTX == confirmBefore {
+				phase := phaseResult{Name: "relay-fallback", Passed: true, DurationMS: time.Since(start).Milliseconds(), Ping: summarizePings(attempts, rtts), CountersBefore: before.P2P, CountersAfter: confirmStatus.P2P, Note: "peer stayed reachable while direct_tx remained unchanged with non-relay UDP blocked"}
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				cleanupErr := fw.Close(cleanupCtx)
+				cleanupCancel()
+				closed = true
+				if cleanupErr != nil {
 					phase.Passed = false
 					return phase, fmt.Errorf("cleanup fallback firewall: %w", cleanupErr)
 				}
 				return phase, nil
 			}
 		}
-		if err := sleepContext(ctx, c.cfg.pollInterval); err != nil {
-			return phaseResult{Name: "relay-fallback"}, err
+		if err := sleepContext(phaseCtx, c.cfg.pollInterval); err != nil {
+			break
 		}
 	}
-	after, _ := c.readStatus(ctx)
-	phase := phaseResult{
-		Name:           "relay-fallback",
-		Passed:         false,
-		DurationMS:     time.Since(start).Milliseconds(),
-		Ping:           summarizePings(attempts, rtts),
-		CountersBefore: before.P2P,
-		CountersAfter:  after.P2P,
-		Note:           "timed out before relay-only reachability was confirmed",
-	}
+	after, _ := c.readStatus(context.Background())
+	phase := phaseResult{Name: "relay-fallback", Passed: false, DurationMS: time.Since(start).Milliseconds(), Ping: summarizePings(attempts, rtts), CountersBefore: before.P2P, CountersAfter: after.P2P, Note: "timed out before relay-only reachability was confirmed"}
 	return phase, fmt.Errorf("relay fallback not confirmed within %s", c.cfg.fallbackTimeout)
 }
 
+func (c *checker) collectPings(ctx context.Context, successes, maxAttempts int) ([]time.Duration, int) {
+	if successes <= 0 || maxAttempts <= 0 {
+		return nil, 0
+	}
+	rtts := make([]time.Duration, 0, successes)
+	attempts := 0
+	for attempts < maxAttempts && len(rtts) < successes && ctx.Err() == nil {
+		attempts++
+		rtt, err := pingOnce(ctx, c.cfg.peerIP.String(), c.cfg.pingTimeout)
+		if err == nil {
+			rtts = append(rtts, rtt)
+		}
+	}
+	return rtts, attempts
+}
+
 func (c *checker) readStatus(ctx context.Context) (health.Snapshot, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.statusURL, nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.cfg.statusURL, nil)
 	if err != nil {
 		return health.Snapshot{}, err
 	}
@@ -433,13 +413,22 @@ func pingOnce(ctx context.Context, peer string, timeout time.Duration) (time.Dur
 		}
 		return 0, errors.New(msg)
 	}
-	if match := pingRTTRE.FindStringSubmatch(string(out)); len(match) == 2 {
-		ms, parseErr := strconv.ParseFloat(match[1], 64)
-		if parseErr == nil {
-			return time.Duration(ms * float64(time.Millisecond)), nil
-		}
+	if rtt, ok := parsePingRTT(string(out)); ok {
+		return rtt, nil
 	}
 	return elapsed, nil
+}
+
+func parsePingRTT(output string) (time.Duration, bool) {
+	match := pingRTTRE.FindStringSubmatch(output)
+	if len(match) != 2 {
+		return 0, false
+	}
+	ms, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return time.Duration(ms * float64(time.Millisecond)), true
 }
 
 func summarizePings(attempts int, rtts []time.Duration) pingSummary {
@@ -473,30 +462,10 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 func printReport(rep report) {
 	fmt.Printf("meshcheck node=%s local=%s peer=%s passed=%t\n", rep.NodeID, rep.VirtualIP, rep.PeerIP, rep.Passed)
 	for _, phase := range rep.Phases {
-		fmt.Printf("%-22s passed=%-5t ping=%d/%d rtt[min/avg/max]=%.2f/%.2f/%.2fms direct_tx=%d->%d healthy=%d->%d fallback=%d->%d\n",
-			phase.Name,
-			phase.Passed,
-			phase.Ping.Success,
-			phase.Ping.Attempts,
-			phase.Ping.MinMS,
-			phase.Ping.AvgMS,
-			phase.Ping.MaxMS,
-			phase.CountersBefore.DirectTX,
-			phase.CountersAfter.DirectTX,
-			phase.CountersBefore.DirectHealthyMarks,
-			phase.CountersAfter.DirectHealthyMarks,
-			phase.CountersBefore.DirectFallbacks,
-			phase.CountersAfter.DirectFallbacks,
-		)
+		fmt.Printf("%-22s passed=%-5t ping=%d/%d rtt[min/avg/max]=%.2f/%.2f/%.2fms direct_tx=%d->%d healthy=%d->%d fallback=%d->%d\n", phase.Name, phase.Passed, phase.Ping.Success, phase.Ping.Attempts, phase.Ping.MinMS, phase.Ping.AvgMS, phase.Ping.MaxMS, phase.CountersBefore.DirectTX, phase.CountersAfter.DirectTX, phase.CountersBefore.DirectHealthyMarks, phase.CountersAfter.DirectHealthyMarks, phase.CountersBefore.DirectFallbacks, phase.CountersAfter.DirectFallbacks)
 		if phase.Note != "" {
 			fmt.Printf("  %s\n", phase.Note)
 		}
 	}
-	fmt.Printf("final p2p: healthy_marks=%d direct_tx=%d direct_rx=%d fallbacks=%d replay_drops=%d\n",
-		rep.FinalP2P.DirectHealthyMarks,
-		rep.FinalP2P.DirectTX,
-		rep.FinalP2P.DirectRX,
-		rep.FinalP2P.DirectFallbacks,
-		rep.FinalP2P.ReplayDrops,
-	)
+	fmt.Printf("final p2p: healthy_marks=%d direct_tx=%d direct_rx=%d fallbacks=%d replay_drops=%d\n", rep.FinalP2P.DirectHealthyMarks, rep.FinalP2P.DirectTX, rep.FinalP2P.DirectRX, rep.FinalP2P.DirectFallbacks, rep.FinalP2P.ReplayDrops)
 }
