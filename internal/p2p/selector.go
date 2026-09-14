@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wangchaozhi/xray-mesh/internal/telemetry"
 )
 
 type CandidateKind string
@@ -37,10 +39,10 @@ type directState struct {
 // Selector deliberately defaults to relay. A candidate is not enough to select
 // a direct path: a later probe layer must explicitly mark that endpoint healthy.
 type Selector struct {
-	mu       sync.Mutex
+	mu        sync.Mutex
 	directTTL time.Duration
-	direct   map[string]directState
-	now      func() time.Time
+	direct    map[string]directState
+	now       func() time.Time
 }
 
 func NewSelector(directTTL time.Duration) *Selector {
@@ -69,6 +71,7 @@ func (s *Selector) MarkDirectHealthy(nodeID, endpoint string, observedAt time.Ti
 	s.mu.Lock()
 	s.direct[nodeID] = directState{endpoint: endpoint, healthyUntil: observedAt.Add(s.directTTL)}
 	s.mu.Unlock()
+	telemetry.P2P.IncDirectHealthy()
 	return nil
 }
 
