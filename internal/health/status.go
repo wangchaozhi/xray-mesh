@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/wangchaozhi/xray-mesh/internal/telemetry"
 )
 
 type State string
@@ -24,12 +26,13 @@ type ServiceStatus struct {
 }
 
 type Snapshot struct {
-	NodeID        string        `json:"node_id"`
-	VirtualIP     string        `json:"virtual_ip"`
-	NetworkPrefix string        `json:"network_prefix"`
-	StartedAt     time.Time     `json:"started_at"`
-	Mesh          ServiceStatus `json:"mesh"`
-	Xray          ServiceStatus `json:"xray"`
+	NodeID        string                `json:"node_id"`
+	VirtualIP     string                `json:"virtual_ip"`
+	NetworkPrefix string                `json:"network_prefix"`
+	StartedAt     time.Time             `json:"started_at"`
+	Mesh          ServiceStatus         `json:"mesh"`
+	Xray          ServiceStatus         `json:"xray"`
+	P2P           telemetry.P2PSnapshot `json:"p2p"`
 }
 
 type Tracker struct {
@@ -75,8 +78,10 @@ func (t *Tracker) setService(service *ServiceStatus, state State, err error) {
 
 func (t *Tracker) Snapshot() Snapshot {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.snap
+	snap := t.snap
+	t.mu.RUnlock()
+	snap.P2P = telemetry.P2P.Snapshot()
+	return snap
 }
 
 func (t *Tracker) Healthy() bool {
